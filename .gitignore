@@ -13,6 +13,8 @@ runs/
 *.pth
 *.npy
 *.h5
+*.log
+*.txt
 
 # envs
 .venv/
