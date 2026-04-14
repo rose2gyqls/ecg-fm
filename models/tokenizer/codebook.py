@@ -8,6 +8,7 @@ codebook collapse 방지를 위해 usage 모니터링 포함.
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributed as dist
 
 
 class VQCodebook(nn.Module):
@@ -91,11 +92,18 @@ class VQCodebook(nn.Module):
 
     def _ema_update(self, z_e: torch.Tensor, indices: torch.Tensor):
         encodings = F.one_hot(indices, self.K).float()  # (B, K)
+        cluster_sum = encodings.sum(0)                  # (K,)
+        dw = encodings.t() @ z_e                        # (K, D)
+
+        # DDP: 모든 rank의 로컬 배치 통계를 합산해 동일한 EMA 업데이트를 적용
+        # → 버퍼가 rank 간 자동 동기화 (broadcast_buffers 불필요)
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(cluster_sum, op=dist.ReduceOp.SUM)
+            dist.all_reduce(dw,          op=dist.ReduceOp.SUM)
 
         self.ema_cluster_size = (
-            self.ema_cluster_size * self.decay + (1 - self.decay) * encodings.sum(0)
+            self.ema_cluster_size * self.decay + (1 - self.decay) * cluster_sum
         )
-        dw = encodings.t() @ z_e                        # (K, D)
         self.ema_w = self.ema_w * self.decay + (1 - self.decay) * dw
 
         # Laplace smoothing

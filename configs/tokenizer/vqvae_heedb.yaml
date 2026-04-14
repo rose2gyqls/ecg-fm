@@ -1,17 +1,17 @@
 # ── VQ-VAE Beat Tokenizer (HEEDB H5 직접 입력) ──────────────────────────────
 data:
   source: heedb                          # heedb | npy
-  data_dir: /home/irteam/ddn-opendata1/h5/heedb/v4.0
-  # file_list: /path/to/train_files.txt  # (선택) 수동 파일 리스트
+  # 200K random subset (11M → 190K train / 10K val)
+  train_list: /home/irteam/local-node-d/hbkimi/ecg-fm/file_lists/train_files.txt
+  val_list:   /home/irteam/local-node-d/hbkimi/ecg-fm/file_lists/val_files.txt
   target_fs: 500                          # 가변 fs → 공통 fs 로 리샘플
   beat_length: 256                        # 비트 리샘플 샘플 수
   before_ms: 200
   after_ms: 400
   normalize: zscore
   max_beats_per_record: 10                # 레코드당 무작위 비트 수 (streaming)
-  cache: false                            # true: 메모리 pre-load (데이터 작을 때만)
+  cache: false
   n_leads: 12
-  train_ratio: 0.95
   seed: 42
 
 model:
@@ -40,7 +40,7 @@ training:
   max_epochs: 200
   warmup_epochs: 10
   grad_clip: 1.0
-  num_workers: 8
+  num_workers: 16
   loss:
     alpha: 1.0
     beta: 0.5

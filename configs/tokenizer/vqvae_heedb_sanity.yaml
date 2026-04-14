@@ -1,0 +1,54 @@
+# ── VQ-VAE sanity-check config (GPU 0,1 DDP, 2000 files subset) ─────────────
+data:
+  source: heedb
+  data_dir: /home/irteam/local-node-d/hbkimi/ecg-fm/sanity_data
+  target_fs: 500
+  beat_length: 256
+  before_ms: 200
+  after_ms: 400
+  normalize: zscore
+  max_beats_per_record: 10
+  cache: false
+  n_leads: 12
+  train_ratio: 0.95
+  seed: 42
+
+model:
+  encoder:
+    in_channels: 1
+    channels: [32, 64, 128, 256]
+    kernel_sizes: [7, 5, 3, 3]
+    strides:   [2, 2, 2, 2]
+    dropout: 0.1
+  decoder:
+    latent_dim: 256
+    channels: [256, 128, 64, 32]
+    kernel_sizes: [3, 3, 5, 7]
+  codebook:
+    num_embeddings: 512
+    embedding_dim: 256
+    commitment_cost: 0.25
+    ema_decay: 0.99
+    ema_update: true
+  latent_dim: 256
+
+training:
+  batch_size: 256
+  lr: 3e-4
+  weight_decay: 1e-4
+  max_epochs: 3
+  warmup_epochs: 0
+  grad_clip: 1.0
+  num_workers: 4
+  loss:
+    alpha: 1.0
+    beta: 0.5
+    use_gradient_loss: true
+    fiducial_weight_map: false
+  log_dir: logs/tokenizer_heedb_sanity
+  ckpt_dir: checkpoints/tokenizer_heedb_sanity
+  save_every: 1
+  eval_every: 1
+  monitor:
+    codebook_usage: true
+    perplexity: true

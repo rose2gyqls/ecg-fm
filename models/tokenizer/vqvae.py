@@ -21,14 +21,19 @@ class VQVAE(nn.Module):
 
     def __init__(self, cfg: dict):
         super().__init__()
-        enc_cfg  = cfg["encoder"]
-        cb_cfg   = cfg["codebook"]
-        dec_cfg  = cfg.get("decoder", {})
+        enc_cfg  = dict(cfg["encoder"])
+        cb_cfg   = dict(cfg["codebook"])
+        dec_cfg  = dict(cfg.get("decoder", {}))
         latent   = cfg.get("latent_dim", 256)
 
-        self.encoder  = BeatEncoder(latent_dim=latent, **enc_cfg)
-        self.codebook = VQCodebook(embedding_dim=latent, **cb_cfg)
-        self.decoder  = BeatDecoder(latent_dim=latent, **dec_cfg)
+        # config에 명시된 차원이 있으면 우선, 없으면 latent fallback (중복 kwarg 회피)
+        enc_cfg.setdefault("latent_dim",    latent)
+        dec_cfg.setdefault("latent_dim",    latent)
+        cb_cfg.setdefault("embedding_dim",  latent)
+
+        self.encoder  = BeatEncoder(**enc_cfg)
+        self.codebook = VQCodebook(**cb_cfg)
+        self.decoder  = BeatDecoder(**dec_cfg)
 
     # ── training forward ─────────────────────────────────────────────────────
 

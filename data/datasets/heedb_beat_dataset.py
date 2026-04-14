@@ -152,20 +152,30 @@ class HEEDBBeatDataset(Dataset):
 
 # ── 파일 리스트 해결 ───────────────────────────────────────────────────────────
 def _resolve_files(cfg: dict, split: str) -> List[str]:
-    # 1) 명시적 file_list
+    # 1) split별 파일 리스트 (train_list / val_list) — 가장 메모리 효율적
+    split_key = f"{split}_list"
+    if cfg.get(split_key):
+        with open(cfg[split_key]) as f:
+            return [ln.strip() for ln in f if ln.strip()]
+
+    # 2) 단일 file_list를 train_ratio로 분할
     if cfg.get("file_list"):
         with open(cfg["file_list"]) as f:
             files = [ln.strip() for ln in f if ln.strip()]
-        return files
+        train_ratio = float(cfg.get("train_ratio", 0.9))
+        rng = random.Random(cfg.get("seed", 42))
+        rng.shuffle(files)
+        cut = int(len(files) * train_ratio)
+        return files[:cut] if split == "train" else files[cut:]
 
-    # 2) data_dir/{split}/*.h5
+    # 3) data_dir/{split}/*.h5
     data_dir = cfg["data_dir"]
     split_dir = os.path.join(data_dir, split)
     files = sorted(glob.glob(os.path.join(split_dir, "**", "*.h5"), recursive=True))
     if files:
         return files
 
-    # 3) data_dir/**/*.h5  를 train/val 비율로 나누기
+    # 4) data_dir/**/*.h5  를 train/val 비율로 나누기
     files = sorted(glob.glob(os.path.join(data_dir, "**", "*.h5"), recursive=True))
     if not files:
         return []
