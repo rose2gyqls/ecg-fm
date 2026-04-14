@@ -37,8 +37,8 @@ training:
   batch_size: 512
   lr: 3e-4
   weight_decay: 1e-4
-  max_epochs: 200
-  warmup_epochs: 10
+  max_epochs: 30
+  warmup_epochs: 3
   grad_clip: 1.0
   num_workers: 16
   loss:
@@ -48,8 +48,8 @@ training:
     fiducial_weight_map: false
   log_dir: logs/tokenizer_heedb
   ckpt_dir: checkpoints/tokenizer_heedb
-  save_every: 10
-  eval_every: 5
+  save_every: 5
+  eval_every: 2
   monitor:
     codebook_usage: true
     perplexity: true

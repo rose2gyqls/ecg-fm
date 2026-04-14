@@ -23,7 +23,9 @@ class MetricLogger:
         logger.update(split="val",   epoch=1, loss=0.38)
     """
 
-    def __init__(self, log_dir: str, filename: str = "metrics.csv"):
+    def __init__(self, log_dir: str, filename: str = "metrics.csv",
+                 verbose: bool = False):
+        """verbose=True면 매 update마다 콘솔 출력. 기본은 CSV만 기록."""
         os.makedirs(log_dir, exist_ok=True)
         self.path       = os.path.join(log_dir, filename)
         self._fieldnames: list[str] = []
@@ -31,6 +33,7 @@ class MetricLogger:
         self._writer = None
         self._start = time.time()
         self._step_count: dict[str, int] = defaultdict(int)
+        self.verbose = verbose
 
     # ── core ─────────────────────────────────────────────────────────────────
 
@@ -39,7 +42,8 @@ class MetricLogger:
                "elapsed": round(time.time() - self._start, 1),
                **kwargs}
         self._write_row(row)
-        self._print(split, epoch, kwargs)
+        if self.verbose:
+            self._print(split, epoch, kwargs)
 
     def _write_row(self, row: dict):
         # 새 key 등장 시 파일 재생성 (헤더 추가)

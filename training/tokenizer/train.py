@@ -16,6 +16,7 @@ import os
 import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
+import time
 import yaml
 import torch
 import torch.distributed as dist
@@ -24,6 +25,7 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
+from tqdm.auto import tqdm
 
 from models.tokenizer.vqvae import VQVAE
 from training.tokenizer.losses import total_vqvae_loss
@@ -46,6 +48,15 @@ def setup_ddp():
 def cleanup_ddp():
     if dist.is_available() and dist.is_initialized():
         dist.destroy_process_group()
+
+
+def _fmt_dur(sec: float) -> str:
+    sec = int(sec)
+    h, r = divmod(sec, 3600)
+    m, s = divmod(r, 60)
+    if h: return f"{h}h{m:02d}m"
+    if m: return f"{m}m{s:02d}s"
+    return f"{s}s"
 
 
 def train(cfg: dict):
@@ -128,14 +139,27 @@ def train(cfg: dict):
         os.makedirs(ckpt_dir, exist_ok=True)
 
     best_val_loss = float("inf")
+    max_epochs    = cfg["training"]["max_epochs"]
+    t_global      = time.time()
 
-    for epoch in range(1, cfg["training"]["max_epochs"] + 1):
+    for epoch in range(1, max_epochs + 1):
         if ddp and train_sampler is not None:
             train_sampler.set_epoch(epoch)
 
         # ── train ──────────────────────────────────────────────────────────
         model.train()
-        for batch in train_loader:
+        t_epoch = time.time()
+        running = {"loss": 0.0, "loss_rec": 0.0, "loss_vq": 0.0,
+                   "loss_fid": 0.0, "perplexity": 0.0}
+        n_steps = 0
+
+        pbar = tqdm(
+            train_loader,
+            desc=f"ep{epoch:03d}/{max_epochs:03d}",
+            disable=(not is_main),
+            dynamic_ncols=True, mininterval=1.0, leave=False,
+        )
+        for batch in pbar:
             x = batch["beat"].to(device, non_blocking=True)       # (B, 1, W)
             x_hat, vq_dict = model(x)
             losses = total_vqvae_loss(
@@ -152,16 +176,42 @@ def train(cfg: dict):
             opt.step()
 
             if is_main:
-                logger.update(
-                    split="train", epoch=epoch,
-                    loss=losses["loss"].item(),
-                    loss_rec=losses["loss_rec"].item(),
-                    loss_vq=losses["loss_vq"].item(),
-                    loss_fid=losses["loss_fid"].item(),
-                    perplexity=vq_dict["perplexity"].item(),
-                )
-
+                vals = {
+                    "loss":       losses["loss"].item(),
+                    "loss_rec":   losses["loss_rec"].item(),
+                    "loss_vq":    losses["loss_vq"].item(),
+                    "loss_fid":   losses["loss_fid"].item(),
+                    "perplexity": vq_dict["perplexity"].item(),
+                }
+                for k, v in vals.items():
+                    running[k] += v
+                n_steps += 1
+                # CSV는 매 step 기록(상세 분석용), 콘솔은 tqdm postfix만
+                logger.update(split="train", epoch=epoch, **vals)
+                if n_steps % 20 == 0:
+                    pbar.set_postfix({
+                        "loss": f"{running['loss']/n_steps:.3f}",
+                        "rec":  f"{running['loss_rec']/n_steps:.3f}",
+                        "ppl":  f"{running['perplexity']/n_steps:.1f}",
+                    })
+        pbar.close()
         scheduler.step()
+
+        # ── epoch summary (rank 0) ────────────────────────────────────────
+        if is_main and n_steps > 0:
+            avg = {k: v / n_steps for k, v in running.items()}
+            elapsed = time.time() - t_epoch
+            total_elapsed = time.time() - t_global
+            eta = elapsed * (max_epochs - epoch)
+            print(
+                f"[ep{epoch:03d}/{max_epochs:03d}] "
+                f"loss={avg['loss']:.4f}  rec={avg['loss_rec']:.4f}  "
+                f"vq={avg['loss_vq']:.4f}  fid={avg['loss_fid']:.4f}  "
+                f"ppl={avg['perplexity']:.2f}  "
+                f"epoch_time={_fmt_dur(elapsed)}  "
+                f"elapsed={_fmt_dur(total_elapsed)}  eta={_fmt_dur(eta)}",
+                flush=True,
+            )
 
         # ── eval ──────────────────────────────────────────────────────────
         if epoch % cfg["training"]["eval_every"] == 0:
@@ -187,7 +237,8 @@ def train(cfg: dict):
 
             if is_main:
                 logger.update(split="val", epoch=epoch, loss=val_loss)
-                print(f"[Epoch {epoch:03d}] val_loss={val_loss:.4f}")
+                tag = " ★best" if val_loss < best_val_loss else ""
+                print(f"          val_loss={val_loss:.4f}{tag}", flush=True)
 
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
