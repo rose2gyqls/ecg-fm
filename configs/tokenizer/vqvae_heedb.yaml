@@ -1,0 +1,55 @@
+# ── VQ-VAE Beat Tokenizer (HEEDB H5 직접 입력) ──────────────────────────────
+data:
+  source: heedb                          # heedb | npy
+  data_dir: /home/irteam/ddn-opendata1/h5/heedb/v4.0
+  # file_list: /path/to/train_files.txt  # (선택) 수동 파일 리스트
+  target_fs: 500                          # 가변 fs → 공통 fs 로 리샘플
+  beat_length: 256                        # 비트 리샘플 샘플 수
+  before_ms: 200
+  after_ms: 400
+  normalize: zscore
+  max_beats_per_record: 10                # 레코드당 무작위 비트 수 (streaming)
+  cache: false                            # true: 메모리 pre-load (데이터 작을 때만)
+  n_leads: 12
+  train_ratio: 0.95
+  seed: 42
+
+model:
+  encoder:
+    in_channels: 1
+    channels: [32, 64, 128, 256]
+    kernel_sizes: [7, 5, 3, 3]
+    strides:   [2, 2, 2, 2]
+    dropout: 0.1
+  decoder:
+    latent_dim: 256
+    channels: [256, 128, 64, 32]
+    kernel_sizes: [3, 3, 5, 7]
+  codebook:
+    num_embeddings: 512
+    embedding_dim: 256
+    commitment_cost: 0.25
+    ema_decay: 0.99
+    ema_update: true
+  latent_dim: 256
+
+training:
+  batch_size: 512
+  lr: 3e-4
+  weight_decay: 1e-4
+  max_epochs: 200
+  warmup_epochs: 10
+  grad_clip: 1.0
+  num_workers: 8
+  loss:
+    alpha: 1.0
+    beta: 0.5
+    use_gradient_loss: true
+    fiducial_weight_map: false
+  log_dir: logs/tokenizer_heedb
+  ckpt_dir: checkpoints/tokenizer_heedb
+  save_every: 10
+  eval_every: 5
+  monitor:
+    codebook_usage: true
+    perplexity: true

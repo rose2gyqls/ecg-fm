@@ -1,0 +1,36 @@
+name: hbkim
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python=3.10
+  - pip
+
+  # PyTorch (CUDA 12.1 기준 — 서버 CUDA 버전에 맞게 조정)
+  - pytorch>=2.1
+  - torchvision
+  - pytorch-cuda=12.1
+
+  - pip:
+    # ECG 전처리
+    - neurokit2>=0.2
+    - wfdb>=4.1
+    - scipy>=1.11
+    - numpy>=1.24
+
+    # 학습
+    - PyYAML>=6.0
+    - tqdm>=4.66
+
+    # 평가
+    - scikit-learn>=1.3
+
+    # 데이터
+    - h5py>=3.9
+
+    # 선택: logging
+    # - wandb
+    # - tensorboard

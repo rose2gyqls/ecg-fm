@@ -1,0 +1,40 @@
+# ── Fine-tuning: Arrhythmia Classification ─────────────────────────────────
+base_pretrain_ckpt: checkpoints/pretrain/best.pt
+
+data:
+  data_dir: /path/to/arrhythmia_data
+  label_col: rhythm_label
+  n_classes: 5                          # e.g. NSR, AF, VT, SVT, other
+  fs: 500
+  beat_length: 256
+  n_leads: 12
+  train_ratio: 0.8
+  val_ratio: 0.1
+
+model:
+  freeze_transformer: false             # true: head only, false: full fine-tune
+  freeze_layers: 0                      # 앞에서 N layers freeze (0=no freeze)
+  classifier:
+    hidden_dim: 256
+    dropout: 0.3
+    pooling: cls                        # "cls" | "mean"
+
+training:
+  batch_size: 64
+  lr: 5e-5
+  weight_decay: 1e-4
+  max_epochs: 50
+  warmup_epochs: 5
+  grad_clip: 1.0
+  num_workers: 8
+  loss: cross_entropy
+  label_smoothing: 0.1
+
+  log_dir: logs/finetune/arrhythmia
+  ckpt_dir: checkpoints/finetune/arrhythmia
+  save_every: 5
+
+metrics:
+  - auroc
+  - f1_macro
+  - accuracy
