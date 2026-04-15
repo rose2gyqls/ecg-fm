@@ -21,8 +21,15 @@ TORCHRUN="$HBKIM_BIN/torchrun"
 CONFIG=${1:-configs/tokenizer/vqvae_base.yaml}
 NPROC=${NPROC:-1}
 GPUS=${GPUS:-0}
+RESUME=${RESUME:-}    # 명시 경로. 비우면 ckpt_dir/last.pt 자동 로드.
 
 export CUDA_VISIBLE_DEVICES="$GPUS"
+export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
+
+EXTRA_ARGS=()
+if [ -n "$RESUME" ]; then
+  EXTRA_ARGS+=(--resume "$RESUME")
+fi
 
 echo "========================================"
 echo "  ECG-FM  |  Phase 1: Beat Tokenizer"
@@ -36,7 +43,7 @@ echo "  Torch  : $($PY -c 'import torch; print(torch.__version__, torch.cuda.is_
 
 if [ "$NPROC" -gt 1 ]; then
   "$TORCHRUN" --standalone --nproc_per_node="$NPROC" \
-    -m training.tokenizer.train --config "$CONFIG"
+    -m training.tokenizer.train --config "$CONFIG" "${EXTRA_ARGS[@]}"
 else
-  "$PY" -m training.tokenizer.train --config "$CONFIG"
+  "$PY" -m training.tokenizer.train --config "$CONFIG" "${EXTRA_ARGS[@]}"
 fi
