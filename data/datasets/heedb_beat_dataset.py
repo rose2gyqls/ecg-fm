@@ -74,7 +74,7 @@ class HEEDBBeatDataset(Dataset):
 
     # ── 단일 레코드 → (M, W) 비트 배열 ─────────────────────────────────────────
     def _extract_record_beats(self, path: str) -> Optional[np.ndarray]:
-        rec = load_heedb_record(path, load_rpeaks=True)
+        rec = load_heedb_record(path, load_rpeaks=False)
         if rec is None:
             return None
 
@@ -83,23 +83,15 @@ class HEEDBBeatDataset(Dataset):
             return None
 
         fs_in = rec["fs"]
-        # 원본 R-peak 우선 사용 → 없거나 불충분하면 Lead II에서 재검출
-        rpeaks_raw = rec["rpeaks"]
-        # fs 리샘플 (비트 자르기 전에 공통 fs로 맞춤)
+        # 일관성을 위해 H5 내장 annotation은 무시하고 항상 Lead II + neurokit으로 재검출.
         if fs_in != self.target_fs:
             signal = resample_signal(signal, fs_in, self.target_fs)
-            if rpeaks_raw is not None:
-                rpeaks_raw = (rpeaks_raw.astype(np.float64)
-                              * self.target_fs / fs_in).astype(np.int64)
 
         fs = self.target_fs
-        if rpeaks_raw is None or len(rpeaks_raw) < 2:
-            try:
-                rpeaks = detect_rpeaks(signal[LEAD_II_INDEX], fs, method="neurokit")
-            except Exception:
-                return None
-        else:
-            rpeaks = rpeaks_raw
+        try:
+            rpeaks = detect_rpeaks(signal[LEAD_II_INDEX], fs, method="neurokit")
+        except Exception:
+            return None
 
         if len(rpeaks) < 2:
             return None

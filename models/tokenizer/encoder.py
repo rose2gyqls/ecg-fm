@@ -7,6 +7,7 @@ Shared 1D-CNN Encoder: beat segment -> continuous latent vector z_e
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from typing import Sequence
 
 
@@ -24,9 +25,13 @@ class BeatEncoder(nn.Module):
         strides: Sequence[int] = (2, 2, 2, 2),
         latent_dim: int = 256,
         dropout: float = 0.1,
+        l2_normalize: bool = False,
     ):
         super().__init__()
         assert len(channels) == len(kernel_sizes) == len(strides)
+
+        self.l2_normalize = l2_normalize
+        self.latent_dim = latent_dim
 
         layers = []
         in_ch = in_channels
@@ -45,8 +50,18 @@ class BeatEncoder(nn.Module):
         self.pool    = nn.AdaptiveAvgPool1d(1)
         self.project = nn.Linear(in_ch, latent_dim)
 
+        # l2_normalize=True → z_e를 단위 구 위에 올린 뒤 학습 가능한
+        # scale로 반지름을 제어. z_e norm이 무한 성장하는 것을 방지.
+        if l2_normalize:
+            self.latent_scale = nn.Parameter(
+                torch.tensor(latent_dim ** 0.5)
+            )
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x: (B, 1, W)"""
         h = self.conv_stack(x)       # (B, C, W')
         h = self.pool(h).squeeze(-1) # (B, C)
-        return self.project(h)       # (B, latent_dim)
+        z = self.project(h)          # (B, latent_dim)
+        if self.l2_normalize:
+            z = F.normalize(z, dim=-1) * self.latent_scale
+        return z

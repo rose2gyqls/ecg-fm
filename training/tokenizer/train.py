@@ -254,7 +254,9 @@ def train(cfg: dict, resume: str | None = None):
         # ── eval ──────────────────────────────────────────────────────────
         if epoch % cfg["training"]["eval_every"] == 0:
             model.eval()
-            local_sum, local_cnt = 0.0, 0
+            local_sums = {"loss": 0.0, "loss_rec": 0.0, "loss_vq": 0.0,
+                          "loss_fid": 0.0, "perplexity": 0.0}
+            local_cnt = 0
             with torch.no_grad():
                 for batch in val_loader:
                     x = batch["beat"].to(device, non_blocking=True)
@@ -265,19 +267,39 @@ def train(cfg: dict, resume: str | None = None):
                         beta=loss_cfg["beta"],
                         use_gradient_loss=loss_cfg["use_gradient_loss"],
                     )
-                    local_sum += losses["loss"].item() * x.size(0)
-                    local_cnt += x.size(0)
+                    bs = x.size(0)
+                    local_sums["loss"]     += losses["loss"].item() * bs
+                    local_sums["loss_rec"] += losses["loss_rec"].item() * bs
+                    local_sums["loss_vq"]  += losses["loss_vq"].item() * bs
+                    local_sums["loss_fid"] += losses["loss_fid"].item() * bs
+                    local_sums["perplexity"] += vq_dict["perplexity"].item() * bs
+                    local_cnt += bs
 
-            stats = torch.tensor([local_sum, float(local_cnt)], device=device)
+            # DDP all-reduce: [loss, loss_rec, loss_vq, loss_fid, ppl, cnt]
+            keys = ["loss", "loss_rec", "loss_vq", "loss_fid", "perplexity"]
+            stats = torch.tensor(
+                [local_sums[k] for k in keys] + [float(local_cnt)],
+                device=device,
+            )
             if ddp:
                 dist.all_reduce(stats, op=dist.ReduceOp.SUM)
-            val_loss = (stats[0] / stats[1].clamp(min=1)).item()
+            cnt = stats[-1].clamp(min=1)
+            val_metrics = {k: (stats[i] / cnt).item() for i, k in enumerate(keys)}
+            val_loss = val_metrics["loss"]
 
             if is_main:
-                logger.update(split="val", epoch=epoch, loss=val_loss)
-                tb.add_scalar("val/loss", val_loss, epoch)
+                logger.update(split="val", epoch=epoch, **val_metrics)
+                for k, v in val_metrics.items():
+                    tb.add_scalar(f"val/{k}", v, epoch)
                 tag = " ★best" if val_loss < best_val_loss else ""
-                print(f"          val_loss={val_loss:.4f}{tag}", flush=True)
+                print(
+                    f"          val  loss={val_loss:.4f}  "
+                    f"rec={val_metrics['loss_rec']:.4f}  "
+                    f"vq={val_metrics['loss_vq']:.4f}  "
+                    f"fid={val_metrics['loss_fid']:.4f}  "
+                    f"ppl={val_metrics['perplexity']:.1f}{tag}",
+                    flush=True,
+                )
 
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss

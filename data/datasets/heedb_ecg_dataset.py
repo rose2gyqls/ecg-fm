@@ -33,18 +33,27 @@ class HEEDBECGDataset(Dataset):
         self.before_ms   = int(cfg.get("before_ms", 200))
         self.after_ms    = int(cfg.get("after_ms", 400))
 
-        data_dir = cfg["data_dir"]
-        split_dir = os.path.join(data_dir, split)
-        if os.path.isdir(split_dir):
-            self.files = sorted(glob.glob(os.path.join(split_dir, "**", "*.h5"),
-                                          recursive=True))
+        # 1) split별 파일 리스트 (train_list / val_list) 우선 — Phase 1과 동일한
+        #    subset을 그대로 재사용해서 train/val 누수 방지
+        split_key = f"{split}_list"
+        if cfg.get(split_key):
+            with open(cfg[split_key]) as f:
+                self.files = [ln.strip() for ln in f if ln.strip()]
         else:
-            all_files = sorted(glob.glob(os.path.join(data_dir, "**", "*.h5"),
-                                         recursive=True))
-            rng = random.Random(cfg.get("seed", 42))
-            rng.shuffle(all_files)
-            cut = int(len(all_files) * float(cfg.get("train_ratio", 0.95)))
-            self.files = all_files[:cut] if split == "train" else all_files[cut:]
+            data_dir = cfg["data_dir"]
+            split_dir = os.path.join(data_dir, split)
+            if os.path.isdir(split_dir):
+                self.files = sorted(glob.glob(
+                    os.path.join(split_dir, "**", "*.h5"), recursive=True
+                ))
+            else:
+                all_files = sorted(glob.glob(
+                    os.path.join(data_dir, "**", "*.h5"), recursive=True
+                ))
+                rng = random.Random(cfg.get("seed", 42))
+                rng.shuffle(all_files)
+                cut = int(len(all_files) * float(cfg.get("train_ratio", 0.95)))
+                self.files = all_files[:cut] if split == "train" else all_files[cut:]
 
         assert self.files, f"No HEEDB files for {split}"
         print(f"[HEEDBECGDataset:{split}] {len(self.files):,} records")

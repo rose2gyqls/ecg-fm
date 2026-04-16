@@ -71,6 +71,10 @@ class VQCodebook(nn.Module):
         # EMA codebook update (only during training)
         if self.training and self.ema_update:
             self._ema_update(z_e, indices)
+
+        if self.ema_update:
+            # EMA 모드: codebook은 EMA로 갱신되므로 commitment loss만 사용.
+            # eval에서도 동일한 수식을 적용해야 train/val loss 비교가 공정.
             loss_vq = self.commitment_cost * F.mse_loss(z_q.detach(), z_e)
         else:
             loss_vq = (
