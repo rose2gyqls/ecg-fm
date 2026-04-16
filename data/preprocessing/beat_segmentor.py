@@ -48,6 +48,43 @@ def detect_rpeaks(signal: np.ndarray, fs: int, method: str = "neurokit") -> np.n
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# R-peak validation
+# ──────────────────────────────────────────────────────────────────────────────
+
+def validate_rpeaks_boundary(
+    rpeaks: np.ndarray, T: int, before: int, after: int
+) -> np.ndarray:
+    """before 샘플 앞/after 샘플 뒤가 완전히 신호 안에 들어오는 R-peak만 유지."""
+    if len(rpeaks) == 0:
+        return rpeaks
+    mask = (rpeaks >= before) & (rpeaks + after <= T)
+    return rpeaks[mask]
+
+
+def validate_rpeaks_local_max(
+    signal: np.ndarray,
+    rpeaks: np.ndarray,
+    window: int = 10,
+    max_shift: int = 8,
+) -> np.ndarray:
+    """R-peak이 ±window 안에서 |signal| argmax와 max_shift 이내에 있는지 확인."""
+    if len(rpeaks) == 0:
+        return rpeaks
+    T = signal.shape[-1]
+    abs_sig = np.abs(signal)
+    keep = np.zeros(len(rpeaks), dtype=bool)
+    for i, r in enumerate(rpeaks):
+        lo = max(0, int(r) - window)
+        hi = min(T, int(r) + window + 1)
+        if hi <= lo:
+            continue
+        local_max_pos = lo + int(np.argmax(abs_sig[lo:hi]))
+        if abs(local_max_pos - int(r)) <= max_shift:
+            keep[i] = True
+    return rpeaks[keep]
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # RR interval features
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -122,6 +159,29 @@ def extract_beats(
         beats.append(segment)
 
     return beats
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Noise / flat-beat filter
+# ──────────────────────────────────────────────────────────────────────────────
+
+def flat_beat_mask(
+    beats: np.ndarray,
+    ptp_min: float = 0.1,
+    std_min: float = 0.01,
+) -> np.ndarray:
+    """
+    Raw 단위(mV)의 beat 배열에 대해 flat/noise 마스크를 반환.
+    True = flat (drop 대상).
+
+    Args:
+        beats : (..., W) — 임의 앞차원 + 시간
+    Returns:
+        mask  : (...,) bool — beats[...,W]에서 W를 제거한 shape
+    """
+    ptp = beats.max(axis=-1) - beats.min(axis=-1)
+    std = beats.std(axis=-1)
+    return (ptp < ptp_min) | (std < std_min)
 
 
 # ──────────────────────────────────────────────────────────────────────────────

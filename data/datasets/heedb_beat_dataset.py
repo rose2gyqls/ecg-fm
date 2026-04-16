@@ -21,6 +21,8 @@ from torch.utils.data import Dataset
 from data.preprocessing.heedb_io       import load_heedb_record, align_to_heedb_order
 from data.preprocessing.beat_segmentor import (
     detect_rpeaks, extract_beats, LEAD_II_INDEX,
+    validate_rpeaks_boundary, validate_rpeaks_local_max,
+    flat_beat_mask,
 )
 from data.preprocessing.resampler      import (
     resample_signal, resample_beat, normalize_beat,
@@ -51,6 +53,23 @@ class HEEDBBeatDataset(Dataset):
         self.normalize   = cfg.get("normalize", "zscore")
         self.max_per_rec = int(cfg.get("max_beats_per_record", 10))
         self.cache_mode  = bool(cfg.get("cache", False))
+
+        # R-peak validation & noise filter (configurable, sensible defaults)
+        rv = cfg.get("rpeak_validation", {}) or {}
+        self.rv_local_max         = bool(rv.get("local_max", True))
+        self.rv_local_max_window  = int(rv.get("local_max_window", 10))
+        self.rv_local_max_shift   = int(rv.get("local_max_shift", 8))
+
+        nf = cfg.get("noise_filter", {}) or {}
+        self.nf_enabled = bool(nf.get("enabled", True))
+        self.nf_ptp_min = float(nf.get("ptp_min", 0.1))    # mV
+        self.nf_std_min = float(nf.get("std_min", 0.01))   # mV
+
+        # Virtual epoch size (streaming mode). split별 독립 지정.
+        vlen_cfg = cfg.get("virtual_len", {}) or {}
+        self._virtual_len: Optional[int] = (
+            int(vlen_cfg[split]) if split in vlen_cfg else None
+        )
 
         self.files = _resolve_files(cfg, split)
         assert self.files, f"No HEEDB files for split={split}"
@@ -88,39 +107,68 @@ class HEEDBBeatDataset(Dataset):
             signal = resample_signal(signal, fs_in, self.target_fs)
 
         fs = self.target_fs
+        ref = signal[LEAD_II_INDEX]
         try:
-            rpeaks = detect_rpeaks(signal[LEAD_II_INDEX], fs, method="neurokit")
+            rpeaks = detect_rpeaks(ref, fs, method="neurokit")
         except Exception:
             return None
 
         if len(rpeaks) < 2:
             return None
 
-        # 12-lead 비트 추출 (동일 R-peak → 리드별 동일 개수)
+        # 1) 경계 거리 필터: before/after 윈도우가 완전히 신호 안에 들어오도록
+        before_samp = int(fs * self.before_ms / 1000)
+        after_samp  = int(fs * self.after_ms  / 1000)
+        rpeaks = validate_rpeaks_boundary(rpeaks, ref.shape[-1],
+                                          before_samp, after_samp)
+
+        # 2) 국소 극대점 검증 (Lead II 기준)
+        if self.rv_local_max and len(rpeaks) > 0:
+            rpeaks = validate_rpeaks_local_max(
+                ref, rpeaks,
+                window=self.rv_local_max_window,
+                max_shift=self.rv_local_max_shift,
+            )
+
+        if len(rpeaks) < 2:
+            return None
+
+        # 12-lead 비트 추출 (동일 R-peak → 리드별 동일 개수, padding 없이 전부 in-bounds)
         beats_arr = extract_beats(signal, rpeaks, fs,
                                   before_ms=self.before_ms,
                                   after_ms=self.after_ms)
-        # extract_beats: 다채널 입력 시 list of (12, W) 반환
         if len(beats_arr) == 0:
             return None
         beats = np.stack(beats_arr, axis=0)              # (N, 12, W_raw)
 
-        # 필요 시 레코드당 비트 수 제한 (랜덤)
-        if self.max_per_rec and beats.shape[0] > self.max_per_rec:
-            sel = np.random.choice(beats.shape[0], self.max_per_rec, replace=False)
-            beats = beats[np.sort(sel)]
-
-        # beat_length 로 리샘플 + lead flatten
+        # 3) noise/flat beat 필터 — (beat, lead) 단위로 drop
         N, L, W = beats.shape
         beats = beats.reshape(N * L, W)                  # (N*12, W_raw)
-        beats = resample_beat(beats, self.beat_length)   # (N*12, beat_length)
+        if self.nf_enabled:
+            flat = flat_beat_mask(beats,
+                                  ptp_min=self.nf_ptp_min,
+                                  std_min=self.nf_std_min)
+            beats = beats[~flat]
+        if beats.shape[0] == 0:
+            return None
+
+        # 레코드당 비트 수 제한 (랜덤, lead-flattened 이후에 적용)
+        limit = self.max_per_rec * L if self.max_per_rec else beats.shape[0]
+        if beats.shape[0] > limit:
+            sel = np.random.choice(beats.shape[0], limit, replace=False)
+            beats = beats[np.sort(sel)]
+
+        # beat_length 로 리샘플
+        beats = resample_beat(beats, self.beat_length)   # (M, beat_length)
         return beats
 
     # ── Dataset interface ────────────────────────────────────────────────────
     def __len__(self):
         if self._cache is not None:
             return len(self._cache)
-        # streaming 모드: record × max_per_rec × 12 추정치
+        if self._virtual_len is not None:
+            return self._virtual_len
+        # streaming 모드 기본값: record × max_per_rec × 12 추정치
         return len(self.files) * self.max_per_rec * 12
 
     def __getitem__(self, idx: int) -> dict:

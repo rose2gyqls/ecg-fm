@@ -1,0 +1,72 @@
+# ── VQ-VAE Beat Tokenizer — 전체 HEEDB + codebook=1024 ─────────────────────────
+# 전체 11.23M HEEDB 레코드. R-peak 검증(경계+국소 극대점) + noise beat 필터 적용.
+data:
+  source: heedb
+  train_list: /home/irteam/local-node-d/hbkimi/ecg-fm/file_lists/train_files_full.txt
+  val_list:   /home/irteam/local-node-d/hbkimi/ecg-fm/file_lists/val_files_full.txt
+  target_fs: 500
+  beat_length: 256
+  before_ms: 200        # 500Hz → 100 samples before R-peak
+  after_ms: 400         # 500Hz → 200 samples after R-peak (총 300 → resample 256)
+  normalize: zscore
+  max_beats_per_record: 10
+  cache: false
+  n_leads: 12
+  seed: 42
+
+  # streaming epoch size (랜덤 샘플링, __len__만 결정)
+  virtual_len:
+    train: 50_000_000
+    val:    1_200_000
+
+  # R-peak 검증
+  rpeak_validation:
+    local_max:         true
+    local_max_window:  10
+    local_max_shift:   8
+
+  # near-zero / flat beat 필터 (mV 단위)
+  noise_filter:
+    enabled: true
+    ptp_min: 0.1
+    std_min: 0.01
+
+model:
+  encoder:
+    in_channels: 1
+    channels: [32, 64, 128, 256]
+    kernel_sizes: [7, 5, 3, 3]
+    strides:   [2, 2, 2, 2]
+    dropout: 0.1
+  decoder:
+    latent_dim: 256
+    channels: [256, 128, 64, 32]
+    kernel_sizes: [3, 3, 5, 7]
+  codebook:
+    num_embeddings: 1024
+    embedding_dim: 256
+    commitment_cost: 0.25
+    ema_decay: 0.99
+    ema_update: true
+  latent_dim: 256
+
+training:
+  batch_size: 512
+  lr: 3e-4
+  weight_decay: 1e-4
+  max_epochs: 100
+  warmup_epochs: 10       # cosine scheduler에 직접 사용되진 않음 (legacy)
+  grad_clip: 1.0
+  num_workers: 18         # 7 GPU × 18 ≈ 126 workers (128 CPU 중 2코어 여유)
+  loss:
+    alpha: 1.0
+    beta: 0.5
+    use_gradient_loss: true
+    fiducial_weight_map: false
+  log_dir:  logs/tokenizer_heedb_full_cb1024
+  ckpt_dir: checkpoints/tokenizer_heedb_full_cb1024
+  save_every: 10          # 100 epoch → 10개의 epoch checkpoint
+  eval_every: 2           # 100 epoch → 50회 eval
+  monitor:
+    codebook_usage: true
+    perplexity: true

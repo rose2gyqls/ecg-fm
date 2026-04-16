@@ -3,11 +3,19 @@
 # Phase 1: VQ-VAE Beat Tokenizer 학습
 #
 # Usage:
-#   bash scripts/run_tokenizer.sh                                     # 단일 GPU, 기본 config
-#   bash scripts/run_tokenizer.sh configs/tokenizer/vqvae_heedb.yaml  # 단일 GPU, 지정 config
-#   NPROC=2 GPUS=0,1 bash scripts/run_tokenizer.sh configs/tokenizer/vqvae_heedb.yaml  # DDP
+#   ./scripts/run_tokenizer.sh configs/tokenizer/vqvae_heedb_full_cb512.yaml
+#
+# GPU 번호는 아래 GPUS 변수를 직접 고쳐서 쓴다. NPROC은 GPUS 개수에서 자동 계산.
+# env로 override도 가능: GPUS=0,1 ./scripts/run_tokenizer.sh configs/...yaml
 
 set -e
+
+# ── 사용할 GPU 번호 ────────────────────────────────────────────────────────────
+# 쉼표로 구분. 학습 시 여기만 고치면 됨. (env GPUS=... 로 override 가능)
+GPUS=${GPUS:-0,1,2,3,4,5,6}
+
+# GPUS 개수로부터 DDP world size(nproc) 자동 계산
+NPROC=$(awk -F, '{print NF}' <<< "$GPUS")
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJECT_ROOT"
@@ -19,8 +27,6 @@ PY="$HBKIM_BIN/python"
 TORCHRUN="$HBKIM_BIN/torchrun"
 
 CONFIG=${1:-configs/tokenizer/vqvae_base.yaml}
-NPROC=${NPROC:-1}
-GPUS=${GPUS:-0}
 RESUME=${RESUME:-}    # 명시 경로. 비우면 ckpt_dir/last.pt 자동 로드.
 
 export CUDA_VISIBLE_DEVICES="$GPUS"
