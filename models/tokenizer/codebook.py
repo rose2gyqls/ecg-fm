@@ -90,21 +90,22 @@ class VQCodebook(nn.Module):
 
     # ── EMA helpers ──────────────────────────────────────────────────────────
 
+    @torch.no_grad()
     def _ema_update(self, z_e: torch.Tensor, indices: torch.Tensor):
+        # detach z_e: EMA 버퍼에 autograd 그래프가 붙지 않도록 (메모리 누수 방지)
+        z_e = z_e.detach()
         encodings = F.one_hot(indices, self.K).float()  # (B, K)
         cluster_sum = encodings.sum(0)                  # (K,)
         dw = encodings.t() @ z_e                        # (K, D)
 
         # DDP: 모든 rank의 로컬 배치 통계를 합산해 동일한 EMA 업데이트를 적용
-        # → 버퍼가 rank 간 자동 동기화 (broadcast_buffers 불필요)
         if dist.is_available() and dist.is_initialized():
             dist.all_reduce(cluster_sum, op=dist.ReduceOp.SUM)
             dist.all_reduce(dw,          op=dist.ReduceOp.SUM)
 
-        self.ema_cluster_size = (
-            self.ema_cluster_size * self.decay + (1 - self.decay) * cluster_sum
-        )
-        self.ema_w = self.ema_w * self.decay + (1 - self.decay) * dw
+        # in-place 업데이트: 버퍼 identity 유지 + 그래프 누적 방지
+        self.ema_cluster_size.mul_(self.decay).add_(cluster_sum, alpha=1 - self.decay)
+        self.ema_w.mul_(self.decay).add_(dw, alpha=1 - self.decay)
 
         # Laplace smoothing
         n = self.ema_cluster_size.sum()
@@ -113,7 +114,7 @@ class VQCodebook(nn.Module):
             / (n + self.K * self.eps)
             * n
         )
-        self.embedding.weight.data = self.ema_w / cluster_size.unsqueeze(1)
+        self.embedding.weight.data.copy_(self.ema_w / cluster_size.unsqueeze(1))
 
     # ── diagnostics ──────────────────────────────────────────────────────────
 

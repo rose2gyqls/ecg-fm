@@ -94,21 +94,27 @@ def train(cfg: dict, resume: str | None = None):
         train_sampler = None
         val_sampler   = None
 
+    nw = int(cfg["training"]["num_workers"])
+    loader_kwargs = dict(
+        num_workers=nw,
+        pin_memory=True,
+        persistent_workers=(nw > 0),
+        prefetch_factor=(4 if nw > 0 else None),
+    )
     train_loader = DataLoader(
         train_ds,
         batch_size=cfg["training"]["batch_size"],
         shuffle=(train_sampler is None),
         sampler=train_sampler,
-        num_workers=cfg["training"]["num_workers"],
-        pin_memory=True,
+        drop_last=True,
+        **loader_kwargs,
     )
     val_loader = DataLoader(
         val_ds,
         batch_size=cfg["training"]["batch_size"],
         shuffle=False,
         sampler=val_sampler,
-        num_workers=cfg["training"]["num_workers"],
-        pin_memory=True,
+        **loader_kwargs,
     )
 
     # ── Model ────────────────────────────────────────────────────────────────
