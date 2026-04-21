@@ -71,6 +71,12 @@ class HEEDBBeatDataset(Dataset):
             int(vlen_cfg[split]) if split in vlen_cfg else None
         )
 
+        # 워커별 beat buffer — record 하나를 처리하면 얻는 ~120 beats를
+        # 버리지 않고 순차적으로 공급. __getitem__당 record 1개 처리 대신
+        # ~120번 호출당 1개 처리로 throughput ~120× 향상.
+        self._buf: Optional[np.ndarray] = None
+        self._buf_idx: int = 0
+
         self.files = _resolve_files(cfg, split)
         assert self.files, f"No HEEDB files for split={split}"
         print(f"[HEEDBBeatDataset:{split}] {len(self.files):,} records")
@@ -175,19 +181,31 @@ class HEEDBBeatDataset(Dataset):
         if self._cache is not None:
             beat = self._cache[idx].copy()
         else:
-            # streaming: 유효 비트가 나올 때까지 레코드를 탐색
-            for _ in range(8):
-                f = self.files[random.randrange(len(self.files))]
-                arr = self._extract_record_beats(f)
-                if arr is None or len(arr) == 0:
-                    continue
-                beat = arr[random.randrange(len(arr))].copy()
-                break
-            else:
+            # streaming: 워커의 beat buffer에서 순차 공급. 비면 다음 record에서 리필.
+            if self._buf is None or self._buf_idx >= len(self._buf):
+                self._refill_buffer()
+
+            if self._buf is None or len(self._buf) == 0:
                 beat = np.zeros(self.beat_length, dtype=np.float32)
+            else:
+                beat = self._buf[self._buf_idx].copy()
+                self._buf_idx += 1
 
         beat = normalize_beat(beat[np.newaxis], self.normalize)  # (1, W)
         return {"beat": torch.from_numpy(beat.astype(np.float32))}
+
+    def _refill_buffer(self):
+        """유효 beats가 나올 때까지 최대 8 record 시도. 실패 시 빈 버퍼 유지."""
+        for _ in range(8):
+            f = self.files[random.randrange(len(self.files))]
+            arr = self._extract_record_beats(f)
+            if arr is not None and len(arr) > 0:
+                np.random.shuffle(arr)   # 동일 record 연속 공급 시 lead 혼합
+                self._buf = arr
+                self._buf_idx = 0
+                return
+        self._buf = None
+        self._buf_idx = 0
 
 
 # ── 파일 리스트 해결 ───────────────────────────────────────────────────────────

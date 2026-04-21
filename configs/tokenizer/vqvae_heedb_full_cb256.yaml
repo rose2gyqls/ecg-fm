@@ -57,7 +57,7 @@ training:
   max_epochs: 100
   warmup_epochs: 10       # cosine scheduler에 직접 사용되진 않음 (legacy)
   grad_clip: 1.0
-  num_workers: 18         # 7 GPU × 18 ≈ 126 workers (128 CPU 중 2코어 여유)
+  num_workers: 24         # 5 GPU × 24 = 120 workers (128 CPU 중 8코어 여유)
   loss:
     alpha: 1.0
     beta: 0.5

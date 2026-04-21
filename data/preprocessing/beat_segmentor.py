@@ -30,7 +30,12 @@ def detect_rpeaks(signal: np.ndarray, fs: int, method: str = "neurokit") -> np.n
     if method == "neurokit":
         try:
             import neurokit2 as nk
-            _, info = nk.ecg_peaks(signal, sampling_rate=fs, method="neurokit")
+            # 저품질 신호에서 neurokit 내부가 np.mean/empty slice RuntimeWarning을
+            # 대량으로 뱉어서 로그를 오염시킴 → 검출 실패는 len(rpeaks)<2로 거르므로
+            # 이 구간의 RuntimeWarning은 안전하게 무시.
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                _, info = nk.ecg_peaks(signal, sampling_rate=fs, method="neurokit")
             return np.array(info["ECG_R_Peaks"], dtype=int)
         except ImportError:
             warnings.warn("neurokit2 not installed, falling back to wfdb")
