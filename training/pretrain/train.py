@@ -32,7 +32,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from models.tokenizer.vqvae import VQVAE
 from models.transformer.ecg_model import ECGFoundationModel
-from models.heads.mlm_head import MaskedBeatModelingHead, MaskedRhythmHead
+from models.heads.mlm_head import MaskedBeatModelingHead, MaskedRhythmHead, MaskedFiducialHead
 from training.pretrain.masking import apply_masking
 from utils.checkpointing import save_checkpoint
 from utils.logging_utils import MetricLogger
@@ -101,6 +101,7 @@ def train(cfg: dict, resume: str | None = None):
         codebook_size=int(cfg["tokenizer"]["codebook_size"]),
     ).to(device)
     rr_head  = MaskedRhythmHead(d_model=int(cfg["model"]["d_model"])).to(device)
+    fid_head = MaskedFiducialHead(d_model=int(cfg["model"]["d_model"])).to(device)
 
     if ddp:
         # find_unused_parameters=True: lead_dropout/mask 비율에 따라 일부 head가
@@ -111,13 +112,17 @@ def train(cfg: dict, resume: str | None = None):
                        find_unused_parameters=True)
         rr_head  = DDP(rr_head, device_ids=[local_rank], output_device=local_rank,
                        find_unused_parameters=True)
+        fid_head = DDP(fid_head, device_ids=[local_rank], output_device=local_rank,
+                       find_unused_parameters=True)
     raw_model    = model.module    if ddp else model
     raw_mlm_head = mlm_head.module if ddp else mlm_head
     raw_rr_head  = rr_head.module  if ddp else rr_head
+    raw_fid_head = fid_head.module if ddp else fid_head
 
     params = (list(model.parameters()) +
               list(mlm_head.parameters()) +
-              list(rr_head.parameters()))
+              list(rr_head.parameters()) +
+              list(fid_head.parameters()))
     if is_main:
         print(f"[Pretrain] Parameters: {sum(p.numel() for p in params):,}")
 
@@ -186,6 +191,8 @@ def train(cfg: dict, resume: str | None = None):
     mask_token_id = int(cfg["tokenizer"]["codebook_size"])
     morph_w       = float(loss_cfg["morphology_weight"])
     rhythm_w      = float(loss_cfg["rhythm_weight"])
+    # fiducial (Q-R, R-S) regression — masked beat 위치에서 학습. 0 이면 비활성.
+    fid_w         = float(loss_cfg.get("fiducial_weight", 0.0))
 
     best_val_loss = float("inf")
     start_epoch   = 1
@@ -203,6 +210,8 @@ def train(cfg: dict, resume: str | None = None):
             raw_mlm_head.load_state_dict(ck["mlm_head"])
         if "rr_head" in ck:
             raw_rr_head.load_state_dict(ck["rr_head"])
+        if "fid_head" in ck:
+            raw_fid_head.load_state_dict(ck["fid_head"])
         if "optimizer" in ck:
             opt.load_state_dict(ck["optimizer"])
         if "scheduler" in ck:
@@ -231,9 +240,10 @@ def train(cfg: dict, resume: str | None = None):
             train_sampler.set_epoch(epoch)
 
         # ── train ──────────────────────────────────────────────────────────
-        model.train(); mlm_head.train(); rr_head.train()
+        model.train(); mlm_head.train(); rr_head.train(); fid_head.train()
         t_epoch = time.time()
-        running = {"loss": 0.0, "loss_mlm": 0.0, "loss_rr": 0.0, "acc": 0.0}
+        running = {"loss": 0.0, "loss_mlm": 0.0, "loss_rr": 0.0,
+                   "loss_fid": 0.0, "acc": 0.0}
         n_steps = 0
 
         pbar = tqdm(
@@ -246,6 +256,7 @@ def train(cfg: dict, resume: str | None = None):
         for batch in pbar:
             beats    = batch["beats"].to(device, non_blocking=True)
             rr_feats = batch["rr_feats"].to(device, non_blocking=True)
+            fid_feats = batch["fid_feats"].to(device, non_blocking=True)
             stft     = batch["stft"].to(device, non_blocking=True)
 
             B, N, L, W = beats.shape
@@ -260,13 +271,23 @@ def train(cfg: dict, resume: str | None = None):
 
             beat_mask = masked["beat_mask"]
             if beat_mask.any():
-                logits_mlm = mlm_head(token_out[beat_mask])
+                hidden_masked = token_out[beat_mask]
+                logits_mlm = mlm_head(hidden_masked)
                 targets    = indices[beat_mask]
                 loss_mlm   = F.cross_entropy(logits_mlm, targets)
                 with torch.no_grad():
                     acc = (logits_mlm.argmax(-1) == targets).float().mean().item()
+
+                # Fiducial (Q-R, R-S) regression on same masked positions
+                if fid_w > 0:
+                    pred_fid = fid_head(hidden_masked)
+                    true_fid = fid_feats[beat_mask]
+                    loss_fid = F.mse_loss(pred_fid, true_fid)
+                else:
+                    loss_fid = torch.tensor(0.0, device=device)
             else:
                 loss_mlm = torch.tensor(0.0, device=device)
+                loss_fid = torch.tensor(0.0, device=device)
                 acc = 0.0
 
             rr_mask = masked["rhythm_mask"]
@@ -277,7 +298,7 @@ def train(cfg: dict, resume: str | None = None):
             else:
                 loss_rr = torch.tensor(0.0, device=device)
 
-            loss = morph_w * loss_mlm + rhythm_w * loss_rr
+            loss = morph_w * loss_mlm + rhythm_w * loss_rr + fid_w * loss_fid
 
             opt.zero_grad()
             loss.backward()
@@ -289,6 +310,7 @@ def train(cfg: dict, resume: str | None = None):
                     "loss":     loss.item(),
                     "loss_mlm": loss_mlm.item(),
                     "loss_rr":  loss_rr.item(),
+                    "loss_fid": loss_fid.item(),
                     "acc":      acc,
                 }
                 for k, v in vals.items():
@@ -303,6 +325,7 @@ def train(cfg: dict, resume: str | None = None):
                         "loss": f"{running['loss']/n_steps:.3f}",
                         "mlm":  f"{running['loss_mlm']/n_steps:.3f}",
                         "rr":   f"{running['loss_rr']/n_steps:.3f}",
+                        "fid":  f"{running['loss_fid']/n_steps:.4f}",
                         "acc":  f"{running['acc']/n_steps:.3f}",
                     })
         pbar.close()
@@ -320,7 +343,8 @@ def train(cfg: dict, resume: str | None = None):
             print(
                 f"[ep{epoch:03d}/{max_epochs:03d}] "
                 f"loss={avg['loss']:.4f}  mlm={avg['loss_mlm']:.4f}  "
-                f"rr={avg['loss_rr']:.4f}  acc={avg['acc']:.3f}  "
+                f"rr={avg['loss_rr']:.4f}  fid={avg['loss_fid']:.5f}  "
+                f"acc={avg['acc']:.3f}  "
                 f"epoch_time={_fmt_dur(elapsed)}  "
                 f"elapsed={_fmt_dur(total_elapsed)}  eta={_fmt_dur(eta)}",
                 flush=True,
@@ -328,13 +352,15 @@ def train(cfg: dict, resume: str | None = None):
 
         # ── eval ──────────────────────────────────────────────────────────
         if epoch % int(cfg["training"]["eval_every"]) == 0:
-            model.eval(); mlm_head.eval(); rr_head.eval()
-            local_sums = {"loss": 0.0, "loss_mlm": 0.0, "loss_rr": 0.0, "acc": 0.0}
+            model.eval(); mlm_head.eval(); rr_head.eval(); fid_head.eval()
+            local_sums = {"loss": 0.0, "loss_mlm": 0.0, "loss_rr": 0.0,
+                          "loss_fid": 0.0, "acc": 0.0}
             local_bs = 0
             with torch.no_grad():
                 for batch in val_loader:
                     beats    = batch["beats"].to(device, non_blocking=True)
                     rr_feats = batch["rr_feats"].to(device, non_blocking=True)
+                    fid_feats = batch["fid_feats"].to(device, non_blocking=True)
                     stft     = batch["stft"].to(device, non_blocking=True)
                     B, N, L, W = beats.shape
                     _, idx_flat = tokenizer.encode(beats.view(B * N * L, 1, W))
@@ -345,12 +371,17 @@ def train(cfg: dict, resume: str | None = None):
 
                     bm = masked["beat_mask"]
                     if bm.any():
-                        logits = mlm_head(token_out[bm])
+                        hidden_bm = token_out[bm]
+                        logits = mlm_head(hidden_bm)
                         tgts   = indices[bm]
                         l_mlm  = F.cross_entropy(logits, tgts).item()
                         accv   = (logits.argmax(-1) == tgts).float().mean().item()
+                        if fid_w > 0:
+                            l_fid = F.mse_loss(fid_head(hidden_bm), fid_feats[bm]).item()
+                        else:
+                            l_fid = 0.0
                     else:
-                        l_mlm, accv = 0.0, 0.0
+                        l_mlm, accv, l_fid = 0.0, 0.0, 0.0
 
                     rmask = masked["rhythm_mask"]
                     if rmask.any():
@@ -358,14 +389,15 @@ def train(cfg: dict, resume: str | None = None):
                     else:
                         l_rr = 0.0
 
-                    total_loss = morph_w * l_mlm + rhythm_w * l_rr
+                    total_loss = morph_w * l_mlm + rhythm_w * l_rr + fid_w * l_fid
                     local_sums["loss"]     += total_loss * B
                     local_sums["loss_mlm"] += l_mlm * B
                     local_sums["loss_rr"]  += l_rr * B
+                    local_sums["loss_fid"] += l_fid * B
                     local_sums["acc"]      += accv * B
                     local_bs += B
 
-            keys = ["loss", "loss_mlm", "loss_rr", "acc"]
+            keys = ["loss", "loss_mlm", "loss_rr", "loss_fid", "acc"]
             stats = torch.tensor(
                 [local_sums[k] for k in keys] + [float(local_bs)],
                 device=device,
@@ -385,6 +417,7 @@ def train(cfg: dict, resume: str | None = None):
                     f"          val  loss={val_loss:.4f}  "
                     f"mlm={val_metrics['loss_mlm']:.4f}  "
                     f"rr={val_metrics['loss_rr']:.4f}  "
+                    f"fid={val_metrics['loss_fid']:.5f}  "
                     f"acc={val_metrics['acc']:.3f}{tag}",
                     flush=True,
                 )
@@ -398,6 +431,7 @@ def train(cfg: dict, resume: str | None = None):
                         extra={
                             "mlm_head": raw_mlm_head.state_dict(),
                             "rr_head":  raw_rr_head.state_dict(),
+                            "fid_head": raw_fid_head.state_dict(),
                         },
                     )
 
@@ -410,6 +444,7 @@ def train(cfg: dict, resume: str | None = None):
                 extra={
                     "mlm_head": raw_mlm_head.state_dict(),
                     "rr_head":  raw_rr_head.state_dict(),
+                    "fid_head": raw_fid_head.state_dict(),
                 },
             )
 
@@ -422,6 +457,7 @@ def train(cfg: dict, resume: str | None = None):
                 extra={
                     "mlm_head":      raw_mlm_head.state_dict(),
                     "rr_head":       raw_rr_head.state_dict(),
+                    "fid_head":      raw_fid_head.state_dict(),
                     "scheduler":     scheduler.state_dict(),
                     "best_val_loss": best_val_loss,
                     "global_step":   global_step,

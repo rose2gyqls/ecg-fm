@@ -53,6 +53,31 @@ class MaskedRhythmHead(nn.Module):
         return self.proj(hidden)
 
 
+class MaskedFiducialHead(nn.Module):
+    """
+    Masked Q-R / R-S interval prediction (seconds).
+
+    Input : (B, S, d_model)  — hidden states at masked beat positions
+    Output: (B, S, 2)        — [qr_sec, rs_sec]
+
+    MLM head와 같은 beat_mask 위치에서 학습된다. Phase 1 fiducial loss가
+    gradient-기반 복원 품질이었던 데 비해, Phase 3에서는 임상적 간격
+    (Q-R, R-S)을 직접 regression target으로 사용해 downstream 분류와의
+    signal alignment를 강화한다.
+    """
+
+    def __init__(self, d_model: int = 256):
+        super().__init__()
+        self.proj = nn.Sequential(
+            nn.Linear(d_model, d_model // 2),
+            nn.GELU(),
+            nn.Linear(d_model // 2, 2),
+        )
+
+    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+        return self.proj(hidden)
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Downstream Classifier Head
 # ──────────────────────────────────────────────────────────────────────────────

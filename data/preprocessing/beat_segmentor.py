@@ -167,6 +167,69 @@ def extract_beats(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Fiducial intervals (Q-R, R-S) — pretrain regression target
+# ──────────────────────────────────────────────────────────────────────────────
+
+def compute_qrs_intervals(
+    beats: np.ndarray,
+    before_ms: int = 200,
+    after_ms: int = 400,
+    beat_length: int = 256,
+    q_window_ms: int = 50,
+    s_window_ms: int = 80,
+) -> np.ndarray:
+    """
+    Resampled beat 배열 (N, L, W) 에서 각 비트/리드의 Q-R, R-S 간격을 추정.
+
+    R은 extract_beats가 before_ms 지점에 정렬해 두었으므로
+        r_pos = round(before_ms / (before_ms+after_ms) * beat_length)
+    이다 (default: 200/600*256 = 85).
+
+    Q = argmin of signal in [r_pos - q_window, r_pos) — R 직전 50ms 창의 최저점
+    S = argmin of signal in (r_pos, r_pos + s_window] — R 직후 80ms 창의 최저점
+
+    zscore-normalize된 beat에서도 정상 QRS의 경우 Q/S가 국소 최저점이므로
+    충분히 안정적. 병적 QRS(RBBB 등)는 정의 자체가 흐려지지만, regression
+    target으로는 기대값이 유지되므로 사용 가능.
+
+    Args:
+        beats       : (N, L, W) float32 — 정규화된 resampled beats
+        before_ms   : extract_beats에 쓴 값과 동일해야 함
+        after_ms    : extract_beats에 쓴 값과 동일해야 함
+        beat_length : W와 동일
+        q_window_ms : Q 탐색창 (R 직전)
+        s_window_ms : S 탐색창 (R 직후)
+
+    Returns:
+        fid : (N, L, 2) float32 — [qr_sec, rs_sec]
+    """
+    total_ms      = before_ms + after_ms
+    ms_per_sample = total_ms / beat_length
+    r_pos         = int(round(before_ms / total_ms * beat_length))
+
+    q_span = max(1, int(round(q_window_ms / ms_per_sample)))
+    s_span = max(1, int(round(s_window_ms / ms_per_sample)))
+    q_lo   = max(0, r_pos - q_span)
+    q_hi   = r_pos                           # [q_lo, q_hi)
+    s_lo   = r_pos + 1
+    s_hi   = min(beat_length, r_pos + 1 + s_span)  # [s_lo, s_hi)
+
+    # 잘못된 window 구성 방어
+    if q_hi <= q_lo or s_hi <= s_lo:
+        return np.zeros(beats.shape[:2] + (2,), dtype=np.float32)
+
+    q_seg = beats[..., q_lo:q_hi]            # (N, L, q_span)
+    s_seg = beats[..., s_lo:s_hi]            # (N, L, s_span)
+
+    q_idx = np.argmin(q_seg, axis=-1) + q_lo # (N, L)
+    s_idx = np.argmin(s_seg, axis=-1) + s_lo # (N, L)
+
+    qr_sec = ((r_pos - q_idx) * ms_per_sample / 1000.0).astype(np.float32)
+    rs_sec = ((s_idx - r_pos) * ms_per_sample / 1000.0).astype(np.float32)
+    return np.stack([qr_sec, rs_sec], axis=-1)  # (N, L, 2)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Noise / flat-beat filter
 # ──────────────────────────────────────────────────────────────────────────────
 

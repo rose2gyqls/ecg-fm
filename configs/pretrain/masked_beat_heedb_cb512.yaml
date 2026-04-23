@@ -1,0 +1,65 @@
+# ── Pre-training (Masked Beat Modeling, HEEDB) — codebook=512 ──────────────
+# Ablation 계열: tokenizer_heedb_full_cb512/best.pt 사용.
+data:
+  source: heedb
+  # Phase 1과 동일한 200K subset 재사용 (train/val 누수 방지)
+  train_list: /home/irteam/local-node-d/hbkimi/ecg-fm/file_lists/train_files.txt
+  val_list:   /home/irteam/local-node-d/hbkimi/ecg-fm/file_lists/val_files.txt
+  target_fs: 500
+  beat_length: 256
+  before_ms: 200
+  after_ms: 400
+  n_leads: 12
+  max_beats_per_lead: 15
+  stft_n_fft: 256
+  stft_hop: 64
+  seed: 42
+  # Fiducial (Q-R, R-S) 탐색창. 소아/성인 공통 QRS(≤120ms) 범위 커버.
+  fiducial:
+    q_window_ms: 50   # R 직전 탐색창 (Q point argmin)
+    s_window_ms: 80   # R 직후 탐색창 (S point argmin)
+
+tokenizer:
+  ckpt: checkpoints/tokenizer_heedb_full_cb512/best.pt
+  codebook_size: 512
+  latent_dim: 256
+  # model_cfg_yaml: configs/tokenizer/vqvae_heedb_full_cb512.yaml  # ckpt에 model_cfg 없을 때
+
+model:
+  d_model: 256
+  nhead: 8
+  num_layers: 8
+  dim_feedforward: 1024
+  dropout: 0.1
+  max_seq_len: 192
+  context:
+    rhythm_input_dim: 3
+    rhythm_hidden: 128
+    global_context_dim: 256
+    stft_channels: [16, 32, 64]
+
+masking:
+  beat_mask_ratio: 0.15
+  rhythm_mask_ratio: 0.15
+  lead_dropout_prob: 0.2
+  lead_dropout_min_leads: 1
+
+training:
+  batch_size: 128
+  lr: 5e-4
+  weight_decay: 1e-4
+  max_epochs: 200
+  warmup_epochs: 20
+  grad_clip: 1.0
+  num_workers: 8
+  loss:
+    morphology_weight: 1.0
+    rhythm_weight: 0.5
+    # fiducial (Q-R, R-S) regression MSE — target scale ~0.03~0.08초 이라
+    # 다른 loss 대비 절대값이 작음. weight를 크게 잡아 기여도 비슷하게 맞춤.
+    # 0 으로 두면 비활성.
+    fiducial_weight: 5.0
+  log_dir:  logs/pretrain_heedb_cb512
+  ckpt_dir: checkpoints/pretrain_heedb_cb512
+  save_every: 10
+  eval_every: 5
