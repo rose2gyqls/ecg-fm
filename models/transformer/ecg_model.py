@@ -50,6 +50,8 @@ class ECGFoundationModel(nn.Module):
             input_dim=ctx.get("rhythm_input_dim", 3),
             hidden=ctx.get("rhythm_hidden", 128),
             d_model=d,
+            norm_mean=ctx.get("rhythm_mean"),    # None이면 정규화 비활성 (legacy 호환)
+            norm_std=ctx.get("rhythm_std"),
         )
 
         # ── Global context ───────────────────────────────────────────────────

@@ -1,0 +1,98 @@
+# ── VQ-VAE Beat Tokenizer v2 — 전체 HEEDB + codebook=512 ─────────────────────
+#
+# v2 변경사항 (vs v1):
+#   1) encoder.l2_normalize=true        — z_e norm bounded → L_vq 우상향 차단
+#   2) codebook.cosine=true             — unit-norm 매칭, commitment loss [0,4]
+#   3) codebook.commitment_cost=0.1     — EMA 모드에서 0.25는 과한 편
+#   4) loss.beta=2.0                    — fiducial(L_fid) 기여도가 너무 작았음 (0.013→0.05)
+#   5) loss.gamma=0.3 + spec_n_ffts     — multi-scale STFT magnitude L1 추가
+#   6) loss.restart_dead_every=500      — dead-code restart로 collapse 방지
+#   7) training.kmeans_init.enabled=true — codebook을 z_e 분포로 워밍업
+#   8) training.early_stop_patience=5   — eval 5회 비개선 시 중단 (eval_every=2 → 10ep)
+#   9) ckpt_dir/log_dir에 _v2 접미어 — 기존 v1 체크포인트와 격리
+data:
+  source: heedb
+  train_list: /home/irteam/local-node-d/hbkimi/ecg-fm/file_lists/train_files_full.txt
+  val_list:   /home/irteam/local-node-d/hbkimi/ecg-fm/file_lists/val_files_full.txt
+  target_fs: 500
+  beat_length: 256
+  before_ms: 200
+  after_ms: 400
+  normalize: zscore
+  max_beats_per_record: 10
+  cache: false
+  n_leads: 12
+  seed: 42
+
+  virtual_len:
+    train: 50_000_000
+    val:    1_200_000
+
+  rpeak_validation:
+    local_max:         true
+    local_max_window:  10
+    local_max_shift:   8
+
+  noise_filter:
+    enabled: true
+    ptp_min: 0.1
+    std_min: 0.01
+
+model:
+  encoder:
+    in_channels: 1
+    channels: [32, 64, 128, 256]
+    kernel_sizes: [7, 5, 3, 3]
+    strides:   [2, 2, 2, 2]
+    dropout: 0.1
+    l2_normalize: true                  # ★ v2: bound z_e norm
+  decoder:
+    latent_dim: 256
+    channels: [256, 128, 64, 32]
+    kernel_sizes: [3, 3, 5, 7]
+  codebook:
+    num_embeddings: 512
+    embedding_dim: 256
+    commitment_cost: 0.1                # ★ v2: 0.25 → 0.1 (EMA + cosine 환경)
+    ema_decay: 0.99
+    ema_update: true
+    cosine: true                        # ★ v2: cosine VQ
+  latent_dim: 256
+
+training:
+  batch_size: 512
+  lr: 3e-4
+  weight_decay: 1e-4
+  max_epochs: 100
+  warmup_epochs: 10
+  grad_clip: 1.0
+  num_workers: 18
+
+  # ★ v2: K-means warm-up
+  kmeans_init:
+    enabled: true
+    n_samples: 50_000                   # all rank 합산. K=512이면 ~100 samples/code
+    n_iter: 10
+
+  # ★ v2: early stop. eval_every=2이므로 patience=5 → 10 epoch 동안 val_loss 비개선 시 중단
+  early_stop_patience: 5
+
+  loss:
+    alpha: 1.0
+    beta: 2.0                           # ★ v2: 0.5 → 2.0 (L_fid 기여도 ↑)
+    gamma: 0.3                          # ★ v2: spectral loss 가중치
+    use_gradient_loss: true
+    fiducial_weight_map: false          # true로 두면 weighted MSE (QRS gaussian)로 대체
+    spec_n_ffts: [32, 64, 128]          # multi-scale STFT (8ms~256ms 윈도우)
+
+    # ★ v2: dead-code restart
+    restart_dead_every: 500             # steps
+    restart_dead_threshold: 1.0         # ema_cluster_size < threshold ⟶ swap
+
+  log_dir:  logs/tokenizer_heedb_full_cb512_v2
+  ckpt_dir: checkpoints/tokenizer_heedb_full_cb512_v2
+  save_every: 10
+  eval_every: 2
+  monitor:
+    codebook_usage: true
+    perplexity: true

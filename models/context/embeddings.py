@@ -43,9 +43,22 @@ class RhythmMLP(nn.Module):
     """
     Input : (B, 3)  — [prev_rr, next_rr, median_rr]  in seconds
     Output: (B, d_model)
+
+    Normalization:
+        norm_mean / norm_std (length=input_dim)을 주면 forward에서 z-score 한 뒤
+        MLP에 넣는다. raw RR 값(0.5~1.2초)은 표준편차가 작아 MLP 입력으로 거의
+        constant처럼 보이는 문제를 보완한다. 버퍼로 등록되어 state_dict에 저장
+        → downstream(benchmark)에서도 동일한 정규화가 자동 적용됨.
     """
 
-    def __init__(self, input_dim: int = 3, hidden: int = 128, d_model: int = 256):
+    def __init__(
+        self,
+        input_dim: int = 3,
+        hidden: int = 128,
+        d_model: int = 256,
+        norm_mean: list | None = None,
+        norm_std: list | None = None,
+    ):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(input_dim, hidden),
@@ -55,7 +68,24 @@ class RhythmMLP(nn.Module):
             nn.Linear(hidden, d_model),
         )
 
+        if norm_mean is not None and norm_std is not None:
+            mean_t = torch.tensor(norm_mean, dtype=torch.float32)
+            std_t = torch.tensor(norm_std, dtype=torch.float32)
+            if mean_t.numel() != input_dim or std_t.numel() != input_dim:
+                raise ValueError(
+                    f"RhythmMLP norm_{{mean,std}} length must match input_dim={input_dim}"
+                )
+            # buffer로 등록 → state_dict에 저장 + .to(device) 자동 따라감
+            self.register_buffer("norm_mean", mean_t, persistent=True)
+            self.register_buffer("norm_std", std_t, persistent=True)
+            self._normalize = True
+        else:
+            self._normalize = False
+
     def forward(self, rr: torch.Tensor) -> torch.Tensor:
+        if self._normalize:
+            # rr shape: (..., input_dim). mean/std broadcast.
+            rr = (rr - self.norm_mean) / (self.norm_std + 1e-8)
         return self.net(rr)
 
 
