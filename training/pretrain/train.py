@@ -1,12 +1,10 @@
 """
-training/pretrain/train.py
-
-Phase 3: Masked Beat Modeling pre-training (DDP 지원)
+Phase 3: Masked beat modeling pre-training (DDP-aware).
 
 Single GPU:
     python -m training.pretrain.train --config configs/pretrain/masked_beat_heedb.yaml
 
-Multi-GPU (예: GPU 0-6):
+Multi-GPU:
     CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6 torchrun --nproc_per_node=7 \
         -m training.pretrain.train --config configs/pretrain/masked_beat_heedb.yaml
 """
@@ -39,7 +37,7 @@ from utils.logging_utils import MetricLogger
 
 
 def setup_ddp():
-    """torchrun 환경이면 DDP 초기화. 단일 프로세스면 (False, 0, 1, 0)."""
+    """Initialize DDP from torchrun env. Returns (False, 0, 1, 0) if not launched via torchrun."""
     if "LOCAL_RANK" not in os.environ:
         return False, 0, 1, 0
     dist.init_process_group(backend="nccl")
@@ -76,7 +74,7 @@ def train(cfg: dict, resume: str | None = None):
     if is_main:
         print(f"[Pretrain] DDP={ddp}  world_size={world_size}  device={device}")
 
-    # ── Frozen tokenizer ────────────────────────────────────────────────────
+    # ---------- Frozen tokenizer ----------
     tok_ckpt_path = cfg["tokenizer"]["ckpt"]
     tok_ckpt = torch.load(tok_ckpt_path, map_location="cpu")
     tok_model_cfg = _load_tok_cfg(cfg, tok_ckpt)
@@ -88,14 +86,16 @@ def train(cfg: dict, resume: str | None = None):
     if is_main:
         print(f"[Pretrain] Tokenizer loaded from {tok_ckpt_path} and frozen.")
 
-    # ── ECG-FM + heads ──────────────────────────────────────────────────────
-    # tokenizer/data 정보를 model cfg에 주입 (ECGFoundationModel 요구사항)
+    # ---------- ECG-FM + heads ----------
+    # Inject tokenizer/data fields that ECGFoundationModel expects.
     model_cfg = dict(cfg["model"])
     model_cfg["codebook_size"] = int(cfg["tokenizer"]["codebook_size"])
     model_cfg["n_leads"]       = int(cfg["data"].get("n_leads", 12))
     model_cfg["max_beats"]     = int(cfg["data"].get("max_beats_per_lead", 15))
 
-    # B-1: RhythmMLP에 RR 정규화 통계를 주입 (state_dict 버퍼로 저장 → downstream도 동일 적용)
+    # If the data config provides RR normalization stats, propagate them into
+    # context so RhythmMLP registers them as buffers (and downstream encoders
+    # automatically inherit the same z-scoring on input).
     norm_cfg = (cfg.get("data", {}) or {}).get("normalization", {}) or {}
     rr_mean = norm_cfg.get("rr_mean")
     rr_std  = norm_cfg.get("rr_std")
@@ -116,8 +116,8 @@ def train(cfg: dict, resume: str | None = None):
     fid_head = MaskedFiducialHead(d_model=int(cfg["model"]["d_model"])).to(device)
 
     if ddp:
-        # find_unused_parameters=True: lead_dropout/mask 비율에 따라 일부 head가
-        # 안 쓰이는 step이 생길 수 있으니 안전하게 켜둠.
+        # find_unused_parameters=True covers the case where masking/dropout
+        # leaves some head with no contributing positions in a given step.
         model    = DDP(model, device_ids=[local_rank], output_device=local_rank,
                        broadcast_buffers=False, find_unused_parameters=True)
         mlm_head = DDP(mlm_head, device_ids=[local_rank], output_device=local_rank,
@@ -138,7 +138,7 @@ def train(cfg: dict, resume: str | None = None):
     if is_main:
         print(f"[Pretrain] Parameters: {sum(p.numel() for p in params):,}")
 
-    # ── Data ────────────────────────────────────────────────────────────────
+    # ---------- Data ----------
     source = cfg["data"].get("source", "npy")
     if source == "heedb":
         from data.datasets.heedb_ecg_dataset import HEEDBECGDataset as _DS
@@ -160,11 +160,12 @@ def train(cfg: dict, resume: str | None = None):
         val_sampler   = None
 
     nw = int(cfg["training"]["num_workers"])
+    pf = int(cfg["training"].get("prefetch_factor", 4))
     loader_kwargs = dict(
         num_workers=nw,
         pin_memory=True,
         persistent_workers=(nw > 0),
-        prefetch_factor=(4 if nw > 0 else None),
+        prefetch_factor=(pf if nw > 0 else None),
     )
     train_loader = DataLoader(
         train_ds,
@@ -182,7 +183,7 @@ def train(cfg: dict, resume: str | None = None):
         **loader_kwargs,
     )
 
-    # ── Optimizer / Scheduler ────────────────────────────────────────────────
+    # ---------- Optimizer / Scheduler ----------
     opt = AdamW(
         params,
         lr=float(cfg["training"]["lr"]),
@@ -195,58 +196,51 @@ def train(cfg: dict, resume: str | None = None):
     loss_cfg = cfg["training"]["loss"]
     ckpt_dir = cfg["training"]["ckpt_dir"]
     log_dir  = cfg["training"]["log_dir"]
+    # TensorBoard dir — when consolidated under logs/tb/pretrain/, all cb runs
+    # can be opened with a single `tensorboard --logdir logs/tb/pretrain`.
+    tb_dir   = cfg["training"].get("tb_dir") or os.path.join(log_dir, "tb")
     logger   = MetricLogger(log_dir) if is_main else None
-    tb       = SummaryWriter(log_dir=os.path.join(log_dir, "tb")) if is_main else None
+    tb       = SummaryWriter(log_dir=tb_dir) if is_main else None
     if is_main:
         os.makedirs(ckpt_dir, exist_ok=True)
+        print(f"[Pretrain] log_dir={log_dir}  tb_dir={tb_dir}")
 
     mask_token_id = int(cfg["tokenizer"]["codebook_size"])
     morph_w       = float(loss_cfg["morphology_weight"])
     rhythm_w      = float(loss_cfg["rhythm_weight"])
-    # fiducial (Q-R, R-S) regression — masked beat 위치에서 학습. 0 이면 비활성.
+    # Fiducial (Q-R, R-S) regression on masked beat positions. 0 disables it.
     fid_w         = float(loss_cfg.get("fiducial_weight", 0.0))
 
-    # B-1: target normalization 통계 — MSE를 z-score 공간에서 계산
-    rr_mean_t = (
-        torch.tensor(rr_mean, dtype=torch.float32, device=device)
-        if rr_mean is not None else None
-    )
-    rr_std_t = (
-        torch.tensor(rr_std, dtype=torch.float32, device=device)
-        if rr_std is not None else None
-    )
-    fid_mean = norm_cfg.get("fid_mean")
-    fid_std  = norm_cfg.get("fid_std")
-    fid_mean_t = (
-        torch.tensor(fid_mean, dtype=torch.float32, device=device)
-        if fid_mean is not None else None
-    )
-    fid_std_t = (
-        torch.tensor(fid_std, dtype=torch.float32, device=device)
-        if fid_std is not None else None
-    )
+    # Target z-score stats: regression heads are trained against normalized
+    # targets so the MSE has a meaningful magnitude (raw RR/fid values are
+    # tiny numbers in seconds and would otherwise produce a ~0 loss).
+    def _to_tensor(x):
+        return None if x is None else torch.tensor(x, dtype=torch.float32, device=device)
+
+    rr_mean_t  = _to_tensor(rr_mean)
+    rr_std_t   = _to_tensor(rr_std)
+    fid_mean_t = _to_tensor(norm_cfg.get("fid_mean"))
+    fid_std_t  = _to_tensor(norm_cfg.get("fid_std"))
     if is_main and (rr_mean_t is not None or fid_mean_t is not None):
         print(f"[Pretrain] target z-score: rr={'on' if rr_mean_t is not None else 'off'}  "
               f"fid={'on' if fid_mean_t is not None else 'off'}")
 
     def _normalize_target(t, mean, std):
-        if mean is None or std is None:
-            return t
-        return (t - mean) / (std + 1e-8)
+        return t if mean is None or std is None else (t - mean) / (std + 1e-8)
 
-    # B-2/B-4: masking strategy + lead-dropout curriculum
-    mask_strategy   = str(mask_cfg.get("mask_strategy", "span"))
-    span_length     = int(mask_cfg.get("span_length", 3))
-    ld_max_prob     = float(mask_cfg.get("lead_dropout_prob", 0.0))
-    ld_schedule     = str(mask_cfg.get("lead_dropout_schedule", "constant"))
-    ld_warmup       = int(mask_cfg.get("lead_dropout_warmup_epochs", 0))
+    # Masking strategy and lead-dropout curriculum.
+    mask_strategy = str(mask_cfg.get("mask_strategy", "span"))
+    span_length   = int(mask_cfg.get("span_length", 3))
+    ld_max_prob   = float(mask_cfg.get("lead_dropout_prob", 0.0))
+    ld_schedule   = str(mask_cfg.get("lead_dropout_schedule", "constant"))
+    ld_warmup     = int(mask_cfg.get("lead_dropout_warmup_epochs", 0))
     if is_main:
         print(f"[Pretrain] mask_strategy={mask_strategy} span={span_length} "
               f"beat_ratio={mask_cfg.get('beat_mask_ratio')} "
               f"rhythm_ratio={mask_cfg.get('rhythm_mask_ratio')} "
-              f"lead_dropout: {ld_schedule} → {ld_max_prob} (warmup={ld_warmup}ep)")
+              f"lead_dropout: {ld_schedule} -> {ld_max_prob} (warmup={ld_warmup}ep)")
 
-    # A-7-style early stopping
+    # Early stopping (0 disables).
     es_patience = int(cfg["training"].get("early_stop_patience", 0) or 0)
     es_bad = 0
 
@@ -254,7 +248,7 @@ def train(cfg: dict, resume: str | None = None):
     start_epoch   = 1
     global_step   = 0
 
-    # ── Resume ───────────────────────────────────────────────────────────────
+    # ---------- Resume ----------
     if resume is None:
         last_path = os.path.join(ckpt_dir, "last.pt")
         if os.path.exists(last_path):
@@ -276,7 +270,7 @@ def train(cfg: dict, resume: str | None = None):
         best_val_loss = float(ck.get("best_val_loss", ck.get("metric") or float("inf")))
         global_step   = int(ck.get("global_step", 0))
         if is_main:
-            print(f"[Resume] Loaded {resume}  → start_epoch={start_epoch}  "
+            print(f"[Resume] Loaded {resume}  -> start_epoch={start_epoch}  "
                   f"best_val_loss={best_val_loss:.4f}", flush=True)
 
     t_global = time.time()
@@ -297,7 +291,7 @@ def train(cfg: dict, resume: str | None = None):
         if ddp and train_sampler is not None:
             train_sampler.set_epoch(epoch)
 
-        # B-4: epoch별 lead_dropout_prob 계산 (curriculum)
+        # Lead-dropout curriculum: ramps from 0 to ld_max_prob over ld_warmup epochs.
         cur_lead_dropout = lead_dropout_schedule(
             epoch=epoch,
             max_prob=ld_max_prob,
@@ -307,7 +301,7 @@ def train(cfg: dict, resume: str | None = None):
         if is_main:
             print(f"[Pretrain] epoch {epoch}: lead_dropout_prob={cur_lead_dropout:.3f}", flush=True)
 
-        # ── train ──────────────────────────────────────────────────────────
+        # ---------- Train ----------
         model.train(); mlm_head.train(); rr_head.train(); fid_head.train()
         t_epoch = time.time()
         running = {"loss": 0.0, "loss_mlm": 0.0, "loss_rr": 0.0,
@@ -325,7 +319,8 @@ def train(cfg: dict, resume: str | None = None):
             beats    = batch["beats"].to(device, non_blocking=True)
             rr_feats = batch["rr_feats"].to(device, non_blocking=True)
             stft     = batch["stft"].to(device, non_blocking=True)
-            # fid_feats는 HEEDBECGDataset에서만 제공. 없으면 zeros로 대체 (fid_w=0이면 미사용).
+            # fid_feats is only emitted by HEEDBECGDataset; zero-fill for the
+            # plain ECGDataset path (the loss is also gated on fid_w > 0).
             if "fid_feats" in batch:
                 fid_feats = batch["fid_feats"].to(device, non_blocking=True)
             else:
@@ -338,7 +333,9 @@ def train(cfg: dict, resume: str | None = None):
 
             masked = _apply_mask(indices, rr_feats, cur_lead_dropout)
 
-            out = model(masked["masked_indices"], masked["masked_rr_feats"], stft)
+            stft_in = stft * (~masked["lead_mask"]).to(stft.dtype).view(B, L, 1, 1)
+
+            out = model(masked["masked_indices"], masked["masked_rr_feats"], stft_in)
             token_out = out[:, 1:, :].view(B, N, L, -1)
 
             beat_mask = masked["beat_mask"]
@@ -350,8 +347,8 @@ def train(cfg: dict, resume: str | None = None):
                 with torch.no_grad():
                     acc = (logits_mlm.argmax(-1) == targets).float().mean().item()
 
-                # Fiducial (Q-R, R-S) regression on same masked positions
-                # target은 z-score 공간에서 비교 → MSE 절대값이 의미 있는 학습 신호로
+                # Fiducial (Q-R, R-S) regression on the same masked positions.
+                # Target is z-scored so the MSE has a meaningful magnitude.
                 if fid_w > 0:
                     pred_fid = fid_head(hidden_masked)
                     true_fid = _normalize_target(fid_feats[beat_mask], fid_mean_t, fid_std_t)
@@ -404,7 +401,7 @@ def train(cfg: dict, resume: str | None = None):
         pbar.close()
         scheduler.step()
 
-        # ── epoch summary (rank 0) ────────────────────────────────────────
+        # ---------- Epoch summary (rank 0) ----------
         if is_main and n_steps > 0:
             avg = {k: v / n_steps for k, v in running.items()}
             for k, v in avg.items():
@@ -423,7 +420,7 @@ def train(cfg: dict, resume: str | None = None):
                 flush=True,
             )
 
-        # ── eval ──────────────────────────────────────────────────────────
+        # ---------- Eval ----------
         if epoch % int(cfg["training"]["eval_every"]) == 0:
             model.eval(); mlm_head.eval(); rr_head.eval(); fid_head.eval()
             local_sums = {"loss": 0.0, "loss_mlm": 0.0, "loss_rr": 0.0,
@@ -442,7 +439,8 @@ def train(cfg: dict, resume: str | None = None):
                     _, idx_flat = tokenizer.encode(beats.view(B * N * L, 1, W))
                     indices = idx_flat.view(B, N, L)
                     masked = _apply_mask(indices, rr_feats, cur_lead_dropout)
-                    out = model(masked["masked_indices"], masked["masked_rr_feats"], stft)
+                    stft_in = stft * (~masked["lead_mask"]).to(stft.dtype).view(B, L, 1, 1)
+                    out = model(masked["masked_indices"], masked["masked_rr_feats"], stft_in)
                     token_out = out[:, 1:, :].view(B, N, L, -1)
 
                     bm = masked["beat_mask"]
@@ -490,7 +488,7 @@ def train(cfg: dict, resume: str | None = None):
                 logger.update(split="val", epoch=epoch, **val_metrics)
                 for k, v in val_metrics.items():
                     tb.add_scalar(f"val/{k}", v, epoch)
-                tag = " ★best" if val_loss < best_val_loss else ""
+                tag = " *best" if val_loss < best_val_loss else ""
                 print(
                     f"          val  loss={val_loss:.4f}  "
                     f"mlm={val_metrics['loss_mlm']:.4f}  "
@@ -516,7 +514,7 @@ def train(cfg: dict, resume: str | None = None):
                 else:
                     es_bad += 1
 
-        # ── periodic save ─────────────────────────────────────────────────
+        # ---------- Periodic + last checkpoint ----------
         if epoch % int(cfg["training"]["save_every"]) == 0 and is_main:
             save_checkpoint(
                 raw_model, opt, epoch, None,
@@ -529,7 +527,6 @@ def train(cfg: dict, resume: str | None = None):
                 },
             )
 
-        # ── always save last.pt (for resume) ──────────────────────────────
         if is_main:
             save_checkpoint(
                 raw_model, opt, epoch, best_val_loss,
@@ -548,7 +545,7 @@ def train(cfg: dict, resume: str | None = None):
         if ddp:
             dist.barrier()
 
-        # ── early stopping (eval이 돈 epoch에 한해서) ─────────────────────
+        # ---------- Early stopping (only on epochs that ran eval) ----------
         evaled = (epoch % int(cfg["training"]["eval_every"]) == 0)
         if es_patience > 0 and evaled:
             stop_flag = 0
@@ -572,10 +569,10 @@ def train(cfg: dict, resume: str | None = None):
 
 def _load_tok_cfg(cfg, ckpt=None):
     """
-    tokenizer model cfg 우선순위:
-      1) ckpt["model_cfg"]
-      2) cfg["tokenizer"]["model_cfg_yaml"] 경로의 YAML
-      3) cfg["tokenizer"]["model"]
+    Resolve the tokenizer model_cfg with this priority:
+      1) ckpt["model_cfg"] (the v2 path always populates this).
+      2) cfg["tokenizer"]["model_cfg_yaml"] -> external YAML.
+      3) cfg["tokenizer"]["model"] inline dict.
     """
     if ckpt is None:
         ckpt = torch.load(cfg["tokenizer"]["ckpt"], map_location="cpu")
@@ -594,7 +591,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="configs/pretrain/masked_beat_heedb.yaml")
     parser.add_argument("--resume", default=None,
-                        help="ckpt path. 미지정 시 ckpt_dir/last.pt 자동 로드.")
+                        help="Checkpoint path to resume from. "
+                             "If omitted, ckpt_dir/last.pt is auto-loaded if present.")
     args = parser.parse_args()
     with open(args.config) as f:
         cfg = yaml.safe_load(f)

@@ -1,12 +1,10 @@
 """
-training/tokenizer/train.py
-
-Phase 1: VQ-VAE Beat Tokenizer 학습 (DDP 지원)
+Phase 1: VQ-VAE beat tokenizer training (DDP-aware).
 
 Single GPU:
     python -m training.tokenizer.train --config configs/tokenizer/vqvae_base.yaml
 
-Multi-GPU (예: GPU 0,1):
+Multi-GPU:
     CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 \
         -m training.tokenizer.train --config configs/tokenizer/vqvae_heedb.yaml
 """
@@ -36,7 +34,7 @@ from utils.logging_utils import MetricLogger
 
 
 def setup_ddp():
-    """torchrun에서 주입된 env로 DDP 초기화. 단일 프로세스면 (False, 0, 1, 0)."""
+    """Initialize DDP from torchrun env. Returns (False, 0, 1, 0) if not launched via torchrun."""
     if "LOCAL_RANK" not in os.environ:
         return False, 0, 1, 0
     dist.init_process_group(backend="nccl")
@@ -61,9 +59,9 @@ def _fmt_dur(sec: float) -> str:
     return f"{s}s"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# A-3: K-means warm-up — encoder만 forward해서 z_e 풀 모은 뒤 codebook 시드
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------
+# K-means warm-up: collect z_e via encoder forward, seed codebook via K-means.
+# ---------------------------------------------------------------------
 @torch.no_grad()
 def kmeans_warmup(
     raw_model: VQVAE,
@@ -77,16 +75,17 @@ def kmeans_warmup(
     is_main: bool = True,
 ):
     """
-    raw_model.encoder만 forward해서 z_e 풀을 구성하고, codebook을 K-means로 초기화.
+    Run encoder forward over a few batches to build a z_e pool, then call
+    codebook.kmeans_init on it.
 
-    DDP: 각 rank가 로컬 batch에서 z_e 모아 → all_gather로 풀 합치기 →
-         rank 0에서 K-means → 결과를 broadcast.
+    DDP: each rank collects locally, sizes are equalized, all_gather builds
+    the shared pool, rank 0 runs K-means, and the resulting buffers are
+    broadcast back. After this returns, every rank holds the same codebook.
     """
-    raw_model.eval()  # BN을 eval로 둬야 z_e 분포가 일관됨
+    raw_model.eval()                       # eval BN -> z_e distribution stable
     K = raw_model.codebook.K
     D = raw_model.codebook.D
 
-    # 각 rank가 모을 로컬 표본 수 (균등 분할). batch 단위로 채우다 보면 약간 더 걸림.
     per_rank = max(n_samples // max(world_size, 1), K * 8)
 
     local_chunks = []
@@ -97,7 +96,7 @@ def kmeans_warmup(
     )
     for batch in train_loader:
         x = batch["beat"].to(device, non_blocking=True)
-        z = raw_model.encoder(x)              # (B, D)
+        z = raw_model.encoder(x)
         local_chunks.append(z.detach())
         collected += z.shape[0]
         pbar.update(z.shape[0])
@@ -110,10 +109,10 @@ def kmeans_warmup(
             print("[kmeans_warmup] no samples collected; skipping.")
         return
 
-    local_pool = torch.cat(local_chunks, dim=0)[:per_rank]  # (Pl, D)
+    local_pool = torch.cat(local_chunks, dim=0)[:per_rank]
 
-    # 모든 rank가 동일 크기로 맞춰야 all_gather 가능 → 가장 작은 rank 길이로 잘라냄.
     if ddp:
+        # all_gather requires identical shapes -> trim to the smallest rank.
         sizes = [torch.tensor([0], device=device) for _ in range(world_size)]
         dist.all_gather(sizes, torch.tensor([local_pool.shape[0]], device=device))
         min_size = int(min(s.item() for s in sizes))
@@ -127,11 +126,9 @@ def kmeans_warmup(
     if is_main:
         print(f"[kmeans_warmup] pool shape = {tuple(pool.shape)} (K={K}, D={D})")
 
-    # rank 0에서 K-means → 결과를 모든 rank로 broadcast
     if (not ddp) or rank == 0:
         raw_model.codebook.kmeans_init(pool, n_iter=n_iter, verbose=is_main)
     if ddp:
-        # codebook.embedding.weight + ema buffers를 broadcast
         dist.broadcast(raw_model.codebook.embedding.weight.data, src=0)
         if raw_model.codebook.ema_update:
             dist.broadcast(raw_model.codebook.ema_w.data, src=0)
@@ -150,7 +147,7 @@ def train(cfg: dict, resume: str | None = None):
     if is_main:
         print(f"[Tokenizer] DDP={ddp}  world_size={world_size}  device={device}")
 
-    # ── Data ────────────────────────────────────────────────────────────────
+    # ---------- Data ----------
     source = cfg["data"].get("source", "npy")
     if source == "heedb":
         from data.datasets.heedb_beat_dataset import HEEDBBeatDataset as _DS
@@ -172,11 +169,12 @@ def train(cfg: dict, resume: str | None = None):
         val_sampler   = None
 
     nw = int(cfg["training"]["num_workers"])
+    pf = int(cfg["training"].get("prefetch_factor", 4))
     loader_kwargs = dict(
         num_workers=nw,
         pin_memory=True,
         persistent_workers=(nw > 0),
-        prefetch_factor=(4 if nw > 0 else None),
+        prefetch_factor=(pf if nw > 0 else None),
     )
     train_loader = DataLoader(
         train_ds,
@@ -194,22 +192,22 @@ def train(cfg: dict, resume: str | None = None):
         **loader_kwargs,
     )
 
-    # ── Model ────────────────────────────────────────────────────────────────
+    # ---------- Model ----------
     model = VQVAE(cfg["model"]).to(device)
     if is_main:
         print(f"[Tokenizer] Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
     if ddp:
-        # EMA 버퍼는 내부에서 all_reduce로 이미 동기화됨 → broadcast_buffers 불필요.
-        # EMA codebook의 embedding.weight는 autograd가 아닌 EMA로 갱신되므로
-        # backward 그래프에 나타나지 않음 → find_unused_parameters=True 필요.
+        # EMA buffers are already synchronized via all_reduce inside _ema_update,
+        # so broadcast_buffers can stay False. find_unused_parameters is required
+        # because embedding.weight gets EMA-updated outside the autograd graph.
         model = DDP(
             model, device_ids=[local_rank], output_device=local_rank,
             broadcast_buffers=False, find_unused_parameters=True,
         )
     raw_model = model.module if ddp else model
 
-    # ── Optimizer / Scheduler ────────────────────────────────────────────────
+    # ---------- Optimizer / Scheduler ----------
     opt = AdamW(
         model.parameters(),
         lr=float(cfg["training"]["lr"]),
@@ -220,26 +218,32 @@ def train(cfg: dict, resume: str | None = None):
     loss_cfg = cfg["training"]["loss"]
     ckpt_dir = cfg["training"]["ckpt_dir"]
     log_dir  = cfg["training"]["log_dir"]
+    # TensorBoard dir: when set, multiple cb runs can share a parent directory
+    # (e.g. logs/tb/tokenizer/cb{256,512,1024,2048}_v2) so a single
+    # `tensorboard --logdir logs/tb/tokenizer` shows them all together.
+    # Falls back to log_dir/tb for backwards compatibility.
+    tb_dir   = cfg["training"].get("tb_dir") or os.path.join(log_dir, "tb")
     logger   = MetricLogger(log_dir) if is_main else None
-    tb       = SummaryWriter(log_dir=os.path.join(log_dir, "tb")) if is_main else None
+    tb       = SummaryWriter(log_dir=tb_dir) if is_main else None
     if is_main:
         os.makedirs(ckpt_dir, exist_ok=True)
+        print(f"[Tokenizer] log_dir={log_dir}  tb_dir={tb_dir}")
 
-    # ── Loss configuration ───────────────────────────────────────────────────
-    use_grad_loss     = bool(loss_cfg.get("use_gradient_loss", True))
-    use_fid_weight    = bool(loss_cfg.get("fiducial_weight_map", False))
-    alpha             = float(loss_cfg.get("alpha", 1.0))
-    beta              = float(loss_cfg.get("beta", 0.5))
-    gamma             = float(loss_cfg.get("gamma", 0.0))
-    spec_n_ffts       = tuple(loss_cfg.get("spec_n_ffts", (32, 64, 128)))
+    # ---------- Loss configuration ----------
+    use_grad_loss  = bool(loss_cfg.get("use_gradient_loss", True))
+    use_fid_weight = bool(loss_cfg.get("fiducial_weight_map", False))
+    alpha          = float(loss_cfg.get("alpha", 1.0))
+    beta           = float(loss_cfg.get("beta", 0.5))
+    gamma          = float(loss_cfg.get("gamma", 0.0))
+    spec_n_ffts    = tuple(loss_cfg.get("spec_n_ffts", (32, 64, 128)))
 
-    # QRS 가중치 맵 — fiducial_weight_map 모드에서만 사용
+    # QRS weight map (only used when use_gradient_loss is False).
     fid_weights = None
     if (not use_grad_loss) and use_fid_weight:
-        # 기본 geometry: before_ms=200, after_ms=400 → R at 1/3 of beat_length
-        beat_length = int(cfg.get("data", {}).get("beat_length", 256))
-        before_ms = float(cfg.get("data", {}).get("before_ms", 200))
-        after_ms = float(cfg.get("data", {}).get("after_ms", 400))
+        data_cfg = cfg.get("data", {})
+        beat_length = int(data_cfg.get("beat_length", 256))
+        before_ms = float(data_cfg.get("before_ms", 200))
+        after_ms  = float(data_cfg.get("after_ms", 400))
         r_pos = int(round(beat_length * before_ms / (before_ms + after_ms)))
         fid_weights = make_qrs_weight_map(
             beat_length=beat_length,
@@ -250,15 +254,16 @@ def train(cfg: dict, resume: str | None = None):
             device=device,
         )
         if is_main:
-            print(f"[Tokenizer] QRS weight map: r_pos={r_pos} sigma={loss_cfg.get('fid_sigma', 20.0)} "
+            print(f"[Tokenizer] QRS weight map: r_pos={r_pos} "
+                  f"sigma={loss_cfg.get('fid_sigma', 20.0)} "
                   f"peak={loss_cfg.get('fid_peak', 3.0)}")
 
-    # ── A-2: dead-code restart settings ──────────────────────────────────────
-    restart_every = int(loss_cfg.get("restart_dead_every", 0) or 0)   # 0 = disabled
+    # Dead-code restart (0 disables).
+    restart_every  = int(loss_cfg.get("restart_dead_every", 0) or 0)
     restart_thresh = float(loss_cfg.get("restart_dead_threshold", 1.0))
 
-    # ── A-7: early stopping settings ─────────────────────────────────────────
-    es_patience = int(cfg["training"].get("early_stop_patience", 0) or 0)  # 0 = disabled
+    # Early stopping (0 disables).
+    es_patience = int(cfg["training"].get("early_stop_patience", 0) or 0)
     es_bad = 0
 
     best_val_loss = float("inf")
@@ -266,7 +271,7 @@ def train(cfg: dict, resume: str | None = None):
     start_epoch   = 1
     global_step   = 0
 
-    # ── Resume ───────────────────────────────────────────────────────────────
+    # ---------- Resume ----------
     if resume is None:
         last_path = os.path.join(ckpt_dir, "last.pt")
         if os.path.exists(last_path):
@@ -287,7 +292,7 @@ def train(cfg: dict, resume: str | None = None):
             print(f"[Resume] Loaded {resume}  → start_epoch={start_epoch}  "
                   f"best_val_loss={best_val_loss:.4f}", flush=True)
 
-    # ── A-3: K-means warmup (resume 아닐 때만 1회 수행) ─────────────────────
+    # K-means warmup runs once before the first training step, only for fresh runs.
     kmeans_cfg = cfg["training"].get("kmeans_init", {}) or {}
     if (
         not resumed_from_ckpt
@@ -298,7 +303,6 @@ def train(cfg: dict, resume: str | None = None):
             print(f"[Tokenizer] K-means warmup: "
                   f"n_samples={kmeans_cfg.get('n_samples', 50_000)} "
                   f"n_iter={kmeans_cfg.get('n_iter', 10)}", flush=True)
-        # 별도 sampler/loader: 가능한 한 매 rank가 다른 batch를 보도록 set_epoch
         if ddp and train_sampler is not None:
             train_sampler.set_epoch(0)
         kmeans_warmup(
@@ -316,7 +320,7 @@ def train(cfg: dict, resume: str | None = None):
         if ddp and train_sampler is not None:
             train_sampler.set_epoch(epoch)
 
-        # ── train ──────────────────────────────────────────────────────────
+        # ---------- Train ----------
         model.train()
         t_epoch = time.time()
         running = {"loss": 0.0, "loss_rec": 0.0, "loss_vq": 0.0,
@@ -335,9 +339,7 @@ def train(cfg: dict, resume: str | None = None):
             x_hat, vq_dict = model(x)
             losses = total_vqvae_loss(
                 x, x_hat, vq_dict["loss_vq"],
-                alpha=alpha,
-                beta=beta,
-                gamma=gamma,
+                alpha=alpha, beta=beta, gamma=gamma,
                 use_gradient_loss=use_grad_loss,
                 fiducial_weights=fid_weights,
                 spec_n_ffts=spec_n_ffts,
@@ -349,16 +351,17 @@ def train(cfg: dict, resume: str | None = None):
             )
             opt.step()
 
-            # ── A-2: dead-code restart (post-step, every N steps) ──────────
+            # Dead-code restart: re-encode the same batch (no extra DataLoader
+            # round-trip) and let the codebook swap dead entries.
             n_dead_restarted = 0
             if restart_every > 0 and (global_step + 1) % restart_every == 0:
-                # encoder forward로 다시 z_e 뽑지 않고, autograd 그래프 밖에서 재사용
                 with torch.no_grad():
                     z_e = raw_model.encoder(x)
                 n_dead_restarted = raw_model.codebook.restart_dead_codes(
                     z_e, threshold=restart_thresh,
                 )
 
+            global_step += 1
             if is_main:
                 vals = {
                     "loss":       losses["loss"].item(),
@@ -372,7 +375,6 @@ def train(cfg: dict, resume: str | None = None):
                 for k, v in vals.items():
                     running[k] += v
                 n_steps += 1
-                global_step += 1
                 logger.update(split="train", epoch=epoch, **vals)
                 for k, v in vals.items():
                     tb.add_scalar(f"train/{k}", v, global_step)
@@ -383,13 +385,10 @@ def train(cfg: dict, resume: str | None = None):
                         "vq":   f"{running['loss_vq']/n_steps:.3f}",
                         "ppl":  f"{running['perplexity']/n_steps:.1f}",
                     })
-            else:
-                # rank>0도 step 카운터 증가 (restart 주기 일치를 위해)
-                global_step += 1
         pbar.close()
         scheduler.step()
 
-        # ── epoch summary (rank 0) ────────────────────────────────────────
+        # ---------- Epoch summary (rank 0) ----------
         if is_main and n_steps > 0:
             avg = {k: v / n_steps for k, v in running.items()}
             for k, v in avg.items():
@@ -410,7 +409,7 @@ def train(cfg: dict, resume: str | None = None):
                 flush=True,
             )
 
-        # ── eval ──────────────────────────────────────────────────────────
+        # ---------- Eval ----------
         do_eval = (epoch % cfg["training"]["eval_every"] == 0)
         val_loss_for_es = None
         if do_eval:
@@ -476,13 +475,12 @@ def train(cfg: dict, resume: str | None = None):
                 else:
                     es_bad += 1
 
-        # ── periodic save ─────────────────────────────────────────────────
+        # ---------- Periodic + last checkpoint ----------
         if epoch % cfg["training"]["save_every"] == 0 and is_main:
             save_checkpoint(raw_model, opt, epoch, None,
                             path=os.path.join(ckpt_dir, f"epoch_{epoch:03d}.pt"),
                             model_cfg=cfg["model"])
 
-        # ── always save last.pt (for resume) ──────────────────────────────
         if is_main:
             save_checkpoint(
                 raw_model, opt, epoch, best_val_loss,
@@ -498,7 +496,7 @@ def train(cfg: dict, resume: str | None = None):
         if ddp:
             dist.barrier()
 
-        # ── A-7: early stopping (after eval; broadcast across ranks) ──────
+        # ---------- Early stopping (broadcast across ranks) ----------
         if es_patience > 0 and val_loss_for_es is not None:
             stop_flag = 0
             if is_main and es_bad >= es_patience:
@@ -523,7 +521,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="configs/tokenizer/vqvae_base.yaml")
     parser.add_argument("--resume", default=None,
-                        help="ckpt path to resume from. 미지정 시 ckpt_dir/last.pt 자동 로드.")
+                        help="Checkpoint path to resume from. "
+                             "If omitted, ckpt_dir/last.pt is auto-loaded if present.")
     args = parser.parse_args()
     with open(args.config) as f:
         cfg = yaml.safe_load(f)

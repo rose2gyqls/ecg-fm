@@ -1,13 +1,17 @@
 """
-models/transformer/ecg_model.py
+ECG Foundation Model: context injection + Pre-LN Transformer encoder.
 
-ECG Foundation Model.
-Stage 2 Context Injection + Stage 3 Transformer Encoder를 통합한 메인 모델.
+Token construction per (beat i, lead j):
+    T_{i,j} = MorphologyEmbedding(z_{i,j})
+            + RhythmMLP(rr_{i,j})
+            + LeadEmbedding(j)
+            + BeatPositionEmbedding(i)
 
-Token construction per beat (i=beat, j=lead):
-    T_{i,j} = Emb(z_{i,j}) + RhythmMLP(p_{i,j}) + LeadEmb(j) + PosEmb(i)
+Sequence layout:
+    [g, T_{1,1}, T_{1,2}, ..., T_{1,L}, T_{2,1}, ..., T_{N,L}]
 
-Sequence:  [g, T_{1,1}, T_{1,2}, ..., T_{N,12}]
+The leading token g is a global STFT context vector. out[:, 0, :] doubles
+as a CLS-style summary for downstream tasks.
 """
 
 import torch
@@ -50,7 +54,10 @@ class ECGFoundationModel(nn.Module):
             input_dim=ctx.get("rhythm_input_dim", 3),
             hidden=ctx.get("rhythm_hidden", 128),
             d_model=d,
-            norm_mean=ctx.get("rhythm_mean"),    # None이면 정규화 비활성 (legacy 호환)
+            # If both rhythm_mean and rhythm_std are provided, RhythmMLP
+            # registers them as buffers and z-scores its input. None disables
+            # normalization (matches legacy v1 checkpoints).
+            norm_mean=ctx.get("rhythm_mean"),
             norm_std=ctx.get("rhythm_std"),
         )
 

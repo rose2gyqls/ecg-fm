@@ -1,8 +1,7 @@
 """
-models/tokenizer/encoder.py
+Shared 1D-CNN encoder: beat segment -> continuous latent vector z_e.
 
-Shared 1D-CNN Encoder: beat segment -> continuous latent vector z_e
-모든 12 lead가 동일한 가중치를 공유한다.
+The same encoder weights are applied to every lead.
 """
 
 import torch
@@ -13,8 +12,15 @@ from typing import Sequence
 
 class BeatEncoder(nn.Module):
     """
-    Input : (B, 1, W)   — single-channel beat (W=256)
+    Input : (B, 1, W)   single-channel beat
     Output: (B, latent_dim)
+
+    Args:
+        l2_normalize: if True, project z onto a sphere of radius `latent_scale`
+                      (a learnable scalar). Useful as a soft norm bound when
+                      pairing with a non-cosine codebook. With cosine VQ this
+                      flag is redundant (the codebook normalizes anyway), so
+                      leave it False to keep things minimal.
     """
 
     def __init__(
@@ -46,22 +52,16 @@ class BeatEncoder(nn.Module):
             in_ch = out_ch
 
         self.conv_stack = nn.Sequential(*layers)
-        # adaptive pooling -> flatten -> project
-        self.pool    = nn.AdaptiveAvgPool1d(1)
+        self.pool = nn.AdaptiveAvgPool1d(1)
         self.project = nn.Linear(in_ch, latent_dim)
 
-        # l2_normalize=True → z_e를 단위 구 위에 올린 뒤 학습 가능한
-        # scale로 반지름을 제어. z_e norm이 무한 성장하는 것을 방지.
         if l2_normalize:
-            self.latent_scale = nn.Parameter(
-                torch.tensor(latent_dim ** 0.5)
-            )
+            self.latent_scale = nn.Parameter(torch.tensor(latent_dim ** 0.5))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """x: (B, 1, W)"""
-        h = self.conv_stack(x)       # (B, C, W')
-        h = self.pool(h).squeeze(-1) # (B, C)
-        z = self.project(h)          # (B, latent_dim)
+        h = self.conv_stack(x)
+        h = self.pool(h).squeeze(-1)
+        z = self.project(h)
         if self.l2_normalize:
             z = F.normalize(z, dim=-1) * self.latent_scale
         return z

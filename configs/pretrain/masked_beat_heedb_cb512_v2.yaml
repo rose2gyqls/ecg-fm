@@ -66,10 +66,10 @@ masking:
   rhythm_mask_ratio: 0.5                # 동일 strategy로 따라감
 
   # ★ B-4: linear curriculum 0 → 0.2 over 50 epochs
-  lead_dropout_prob: 0.2                # 최종(max) 값
+  lead_dropout_prob: 0.4                # ★ leak-fix: 0.2 → 0.4 (per-lead Bernoulli)
   lead_dropout_schedule: linear         # constant | linear | cosine
   lead_dropout_warmup_epochs: 50
-  lead_dropout_min_leads: 1
+  lead_dropout_min_leads: 6             # ★ leak-fix: 1 → 6 (always keep ≥6 leads)
 
 training:
   batch_size: 32                        # ★ v2: 128 → 32 (d=512 + S=361 메모리 보상)
@@ -78,7 +78,8 @@ training:
   max_epochs: 200
   warmup_epochs: 20
   grad_clip: 1.0
-  num_workers: 8
+  num_workers: 12
+  prefetch_factor: 8
 
   early_stop_patience: 10               # ★ v2: eval_every=5 → 50 epoch 비개선
 
@@ -88,6 +89,7 @@ training:
     fiducial_weight: 1.0                # ★ v2: 5.0 → 1.0 (target z-score 했으므로 dominant 지양)
 
   log_dir:  logs/pretrain_heedb_cb512_v2
+  tb_dir:   logs/tb/pretrain/cb512_v2
   ckpt_dir: checkpoints/pretrain_heedb_cb512_v2
   save_every: 10
   eval_every: 5

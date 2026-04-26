@@ -1,47 +1,41 @@
 """
-training/tokenizer/losses.py
+VQ-VAE training losses.
 
-L_total = L_rec + α·L_vq + β·L_fid + γ·L_spec
+L_total = L_rec + alpha * L_vq + beta * L_fid + gamma * L_spec
 
-  L_rec  : MSE(x, x̂)
-  L_vq   : commitment (EMA) or commitment + codebook (non-EMA)
-  L_fid  : (a) gradient proxy ‖∇x − ∇x̂‖²  ⟶ QRS 등 변화 구간 보존
-           (b) point-wise weighted MSE (QRS 가우시안 가중치) — config 토글
-  L_spec : multi-scale STFT magnitude L1 — 시간축 MSE만으론 morphology가
-           부드럽게 깎이는 문제를 보완
+  L_rec  : MSE in time domain.
+  L_vq   : commitment (EMA mode) or commitment + codebook (non-EMA mode);
+           computed inside VQCodebook and passed in.
+  L_fid  : either gradient proxy ||dx - dx_hat||^2 (default) to preserve
+           QRS-like fast transitions, or a point-wise weighted MSE peaked
+           around the R position.
+  L_spec : multi-scale STFT magnitude L1, complementing the time-domain
+           MSE so morphology stays sharp instead of being smoothed out.
 """
 
 from __future__ import annotations
-import math
 import torch
 import torch.nn.functional as F
 from typing import Iterable, Optional
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Reconstruction
-# ──────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 def reconstruction_loss(x: torch.Tensor, x_hat: torch.Tensor) -> torch.Tensor:
-    """L_rec: MSE between original and reconstructed beat."""
     return F.mse_loss(x_hat, x)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Fiducial — gradient proxy (default)
-# ──────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
+# Fiducial proxies
+# -----------------------------------------------------------------------------
 def gradient_loss(x: torch.Tensor, x_hat: torch.Tensor) -> torch.Tensor:
-    """
-    ‖∇x − ∇x̂‖²   — finite difference along time axis (last dim).
-    QRS / P / T 의 급격한 기울기 보존.
-    """
+    """||dx - dx_hat||^2 with dx as a finite difference along the last axis."""
     dx = x[..., 1:] - x[..., :-1]
     dx_hat = x_hat[..., 1:] - x_hat[..., :-1]
     return F.mse_loss(dx_hat, dx)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Fiducial — point-wise weighted MSE (QRS-focused)
-# ──────────────────────────────────────────────────────────────────────────────
 def make_qrs_weight_map(
     beat_length: int = 256,
     r_pos: int = 85,
@@ -52,13 +46,11 @@ def make_qrs_weight_map(
     dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
     """
-    Gaussian bump weight map peaked at R-peak position.
+    Gaussian bump centered at the R-peak position.
 
-    Default geometry assumes:
-      before_ms=200, after_ms=400 → R at 1/3 of the resampled 256 = 85.
-
-    sigma=20 (~40 sample full width) covers Q–R–S 윈도우(±80ms 정도).
-    Returns: (beat_length,) tensor.
+    Default geometry assumes before_ms=200, after_ms=400, beat_length=256
+    -> r_pos = round(200/600 * 256) = 85. sigma=20 covers roughly
+    +-80 ms around R, i.e. the Q-R-S window.
     """
     t = torch.arange(beat_length, dtype=dtype, device=device)
     g = torch.exp(-0.5 * ((t - r_pos) / sigma) ** 2)
@@ -70,26 +62,22 @@ def weighted_mse_loss(
     x_hat: torch.Tensor,
     weights: torch.Tensor,
 ) -> torch.Tensor:
-    """
-    Point-wise weighted MSE.
-    weights: (W,) broadcast 가능한 형태. mean으로 정규화돼 있다고 보고 그대로 사용.
-    """
-    # broadcast: weights (W,) → (1, 1, W)
+    """Per-sample MSE multiplied by `weights` (broadcast-compatible)."""
     w = weights.view(1, 1, -1) if weights.dim() == 1 else weights
     return ((x_hat - x) ** 2 * w).mean()
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Spectral — multi-scale STFT magnitude L1
-# ──────────────────────────────────────────────────────────────────────────────
-# torch.hann_window를 매 step 만들지 않도록 캐시.
+# -----------------------------------------------------------------------------
+# Multi-scale STFT magnitude L1
+# -----------------------------------------------------------------------------
+# Cache hann windows so we don't reallocate one per step.
 _window_cache: dict[tuple[int, str, str], torch.Tensor] = {}
 
 
 def _hann_window(n_fft: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
     key = (n_fft, str(device), str(dtype))
     w = _window_cache.get(key)
-    if w is None or w.device != device:
+    if w is None:
         w = torch.hann_window(n_fft, device=device, dtype=dtype)
         _window_cache[key] = w
     return w
@@ -104,11 +92,12 @@ def multiscale_stft_loss(
     Multi-scale STFT magnitude L1.
 
     Args:
-        x, x_hat : (B, 1, W) — z-scored beat waveforms.
-                   beat_length=256, fs=500Hz라 n_fft={32,64,128} (= 64ms~256ms 윈도우)가
-                   QRS 시간 스케일과 잘 맞는다.
+        x, x_hat: (B, 1, W) z-scored beat waveforms (W=256, fs=500 Hz).
+                  n_fft in {32, 64, 128} corresponds to 64ms / 128ms / 256ms
+                  windows, which bracket the QRS time scale.
+
+    n_fft values >= W are skipped silently.
     """
-    # squeeze channel dim
     if x.dim() == 3 and x.shape[1] == 1:
         x = x.squeeze(1)
         x_hat = x_hat.squeeze(1)
@@ -117,7 +106,6 @@ def multiscale_stft_loss(
     n_scales = 0
     for n_fft in n_ffts:
         if n_fft >= x.shape[-1]:
-            # beat_length보다 큰 n_fft는 의미 없음 — 그냥 skip
             continue
         hop = max(n_fft // 4, 1)
         win = _hann_window(n_fft, x.device, x.dtype)
@@ -132,14 +120,12 @@ def multiscale_stft_loss(
         total = total + F.l1_loss(Xs_hat.abs(), Xs.abs())
         n_scales += 1
 
-    if n_scales == 0:
-        return x.new_zeros(())
-    return total / n_scales
+    return total / n_scales if n_scales > 0 else x.new_zeros(())
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Total
-# ──────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
+# Total loss
+# -----------------------------------------------------------------------------
 def total_vqvae_loss(
     x: torch.Tensor,
     x_hat: torch.Tensor,
@@ -152,13 +138,14 @@ def total_vqvae_loss(
     spec_n_ffts: Iterable[int] = (32, 64, 128),
 ) -> dict:
     """
-    Returns dict with individual + total losses.
+    Combine the four reconstruction-side terms with the codebook commitment.
 
-    Notes:
-      - `use_gradient_loss=True` → L_fid = gradient_loss (시간축 미분 MSE)
-        `False` + fiducial_weights 제공 → L_fid = weighted_mse_loss(QRS 가중)
-        `False` + weights=None → L_fid = plain MSE (= L_rec과 동일, 사실상 비활성)
-      - gamma=0이면 spectral loss 계산 자체를 건너뛰어 cost 0.
+    Fiducial behavior:
+        use_gradient_loss=True             -> L_fid = gradient_loss(x, x_hat)
+        use_gradient_loss=False, weights!=None -> L_fid = weighted MSE around R
+        use_gradient_loss=False, weights=None -> L_fid disabled (zero)
+
+    gamma=0 short-circuits the spectral loss entirely.
     """
     l_rec = reconstruction_loss(x, x_hat)
 
@@ -167,12 +154,12 @@ def total_vqvae_loss(
     elif fiducial_weights is not None:
         l_fid = weighted_mse_loss(x, x_hat, fiducial_weights)
     else:
-        l_fid = l_rec.detach() * 0  # no-op
+        l_fid = x.new_zeros(())
 
-    if gamma > 0:
-        l_spec = multiscale_stft_loss(x, x_hat, n_ffts=spec_n_ffts)
-    else:
-        l_spec = x.new_zeros(())
+    l_spec = (
+        multiscale_stft_loss(x, x_hat, n_ffts=spec_n_ffts)
+        if gamma > 0 else x.new_zeros(())
+    )
 
     total = l_rec + alpha * loss_vq + beta * l_fid + gamma * l_spec
 

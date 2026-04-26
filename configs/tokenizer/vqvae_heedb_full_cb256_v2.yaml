@@ -66,7 +66,8 @@ training:
   max_epochs: 100
   warmup_epochs: 10
   grad_clip: 1.0
-  num_workers: 18
+  num_workers: 24
+  prefetch_factor: 8
 
   # ★ v2: K-means warm-up
   kmeans_init:
@@ -90,6 +91,7 @@ training:
     restart_dead_threshold: 1.0         # ema_cluster_size < threshold ⟶ swap
 
   log_dir:  logs/tokenizer_heedb_full_cb256_v2
+  tb_dir:   logs/tb/tokenizer/cb256_v2
   ckpt_dir: checkpoints/tokenizer_heedb_full_cb256_v2
   save_every: 10
   eval_every: 2

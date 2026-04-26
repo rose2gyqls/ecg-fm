@@ -1,17 +1,21 @@
 """
-training/pretrain/masking.py
+Masking strategies for masked beat modeling.
 
-Pre-training용 마스킹 전략:
-1. Beat token masking — i.i.d. (legacy) 또는 span (v2 default, 인접 K-beat 묶음)
-2. Rhythm vector masking
-3. Lead dropout — schedule(curriculum) 지원
+Provides:
+  1. Beat token masking
+       - mask_beat_tokens_iid:    independent per (batch, beat, lead).
+       - mask_beat_tokens_span:   contiguous-beat spans, aligned across leads.
+  2. Rhythm feature masking (i.i.d. or span, mirrors the beat masking strategy).
+  3. Lead dropout (entire leads zeroed across all beats), per-lead Bernoulli
+     with `min_leads` floor and an optional curriculum on the dropout prob.
 
-Notes:
-  - i.i.d. per-(beat, lead) 마스킹은 ECG의 강한 redundancy(인접 beat가 거의 같은
-    토큰, 같은 beat 내 lead들도 매우 유사) 때문에 너무 쉽게 풀린다.
-  - span masking은 인접한 N개의 beat를 한 번에 마스킹해 적어도 beat-시간축의
-    redundancy 회복을 막는다. lead-축 redundancy는 stair-step / whole-beat
-    block masking(=Phase C)에서 별도로 처리한다.
+Cross-lead alignment (whole-beat block masking): spans are sampled per
+(batch,) and broadcast across all 12 leads, so the same beat positions
+are masked simultaneously across leads. ECG morphology has strong
+inter-lead redundancy (12 leads view the same heartbeat from different
+angles → nearly identical codebook tokens), and lead-independent masking
+let the model trivially copy unmasked leads. Aligned masking forces
+prediction from temporal context (other beats) and the global STFT.
 """
 
 import math
@@ -19,118 +23,114 @@ import torch
 from typing import Tuple
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 1a. Beat token masking — i.i.d. per (b, n, l)  (legacy)
-# ──────────────────────────────────────────────────────────────────────────────
-
+# -----------------------------------------------------------------------------
+# Beat token masking
+# -----------------------------------------------------------------------------
 def mask_beat_tokens_iid(
     indices: torch.Tensor,
     mask_ratio: float = 0.15,
     mask_token_id: int = 512,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Args:
-        indices   : (B, N_beats, L)  VQ indices
-        mask_ratio: fraction to mask
-        mask_token_id: ID to replace masked tokens with
-
-    Returns:
-        masked_indices : (B, N, L)
-        mask           : (B, N, L) bool, True = masked
+    Independent per-position masking. Returns (masked_indices, mask).
     """
     B, N, L = indices.shape
     mask = torch.rand(B, N, L, device=indices.device) < mask_ratio
-    masked_indices = indices.clone()
-    masked_indices[mask] = mask_token_id
-    return masked_indices, mask
+    masked = indices.clone()
+    masked[mask] = mask_token_id
+    return masked, mask
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 1b. Beat token masking — span (consecutive beats), per-(b, l) independent
-# ──────────────────────────────────────────────────────────────────────────────
 
 def mask_beat_tokens_span(
     indices: torch.Tensor,
     mask_ratio: float = 0.5,
     span_length: int = 3,
     mask_token_id: int = 512,
+    cross_lead_aligned: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Per (b, l), 인접한 `span_length` 개의 beat를 한 묶음으로 마스킹.
-    전체 마스킹 비율 ≈ mask_ratio.
+    Per batch, pick start positions and mask `span_length` consecutive beats.
+    Total fraction masked is approximately `mask_ratio`; overlapping spans
+    collapse via `union`, so realized ratio is slightly lower
+    (the same pattern is used by wav2vec2 / data2vec).
 
-    Implementation:
-      - n_spans = ceil(N * mask_ratio / span_length) 만큼의 span을 (b, l) 별로
-        독립적으로 random start 위치로 배치.
-      - 겹치는 span은 그대로 union 처리 → 실제 비율이 ratio보다 약간 낮을 수도
-        있지만 wav2vec2/data2vec와 같은 관행.
-      - 완전 vectorized — Python loop 없음.
+    cross_lead_aligned=True (default): the same beat positions are masked
+    across all 12 leads (whole-beat block masking). This is required to
+    prevent the model from trivially recovering masked tokens by copying
+    unmasked leads at the same beat position.
 
-    Edge case:
-      - N <= span_length 인 경우: 한 span을 통째로 마스킹 (ratio 1.0).
+    cross_lead_aligned=False: legacy lead-independent masking
+    (start positions sampled per (batch, lead)).
+
+    Edge case: if N <= span_length, mask everything.
     """
     B, N, L = indices.shape
     if span_length <= 1:
         return mask_beat_tokens_iid(indices, mask_ratio, mask_token_id)
     if N <= span_length:
-        # 전부 마스킹
         mask = torch.ones(B, N, L, dtype=torch.bool, device=indices.device)
-        masked_indices = indices.clone()
-        masked_indices[mask] = mask_token_id
-        return masked_indices, mask
+        masked = indices.clone()
+        masked[mask] = mask_token_id
+        return masked, mask
 
     n_spans = max(1, math.ceil(N * mask_ratio / span_length))
     max_start = N - span_length + 1
 
-    # (B, n_spans, L) random start positions per (b, l)
-    starts = torch.randint(0, max_start, (B, n_spans, L), device=indices.device)
+    if cross_lead_aligned:
+        starts = torch.randint(0, max_start, (B, n_spans, 1), device=indices.device)
+        starts = starts.expand(B, n_spans, L)
+    else:
+        starts = torch.randint(0, max_start, (B, n_spans, L), device=indices.device)
 
-    # 각 span은 [start, start+span_length) 의 N-축 범위를 마스킹
-    # pos:    (1, 1, N, 1)
-    # starts: (B, n_spans, 1, L)
     pos = torch.arange(N, device=indices.device).view(1, 1, N, 1)
     s = starts.unsqueeze(2)
-    in_span = (pos >= s) & (pos < s + span_length)        # (B, n_spans, N, L)
-    mask = in_span.any(dim=1)                              # (B, N, L)
+    in_span = (pos >= s) & (pos < s + span_length)
+    mask = in_span.any(dim=1)
 
-    masked_indices = indices.clone()
-    masked_indices[mask] = mask_token_id
-    return masked_indices, mask
+    masked = indices.clone()
+    masked[mask] = mask_token_id
+    return masked, mask
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 2. Rhythm feature masking (i.i.d. or span — 따라감)
-# ──────────────────────────────────────────────────────────────────────────────
-
+# -----------------------------------------------------------------------------
+# Rhythm feature masking
+# -----------------------------------------------------------------------------
 def mask_rhythm_features(
     rr_feats: torch.Tensor,
     mask_ratio: float = 0.15,
     span_length: int = 1,
+    cross_lead_aligned: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Args:
-        rr_feats : (B, N_beats, L, 3)
-        span_length: 1=i.i.d., >=2=span (beat 단위로 묶음)
-    Returns:
-        masked_rr : same shape, masked positions set to 0
-        mask      : (B, N_beats, L) bool
+    rr_feats: (B, N, L, 3). Returns (masked_rr, mask). Masked entries are
+    set to zero. `span_length` >= 2 mirrors `mask_beat_tokens_span`.
+
+    RR features are lead-invariant (the same RR triplet is repeated across
+    all leads of a beat), so cross-lead-aligned masking is required for
+    the rhythm task to be non-trivial; otherwise an unmasked lead at the
+    same beat reveals the answer.
     """
     B, N, L, _ = rr_feats.shape
     if span_length <= 1:
-        mask = torch.rand(B, N, L, device=rr_feats.device) < mask_ratio
+        if cross_lead_aligned:
+            row = torch.rand(B, N, 1, device=rr_feats.device) < mask_ratio
+            mask = row.expand(B, N, L)
+        else:
+            mask = torch.rand(B, N, L, device=rr_feats.device) < mask_ratio
     else:
-        # Reuse span helper on a dummy index tensor
         dummy = torch.zeros(B, N, L, dtype=torch.long, device=rr_feats.device)
-        _, mask = mask_beat_tokens_span(dummy, mask_ratio, span_length, mask_token_id=0)
+        _, mask = mask_beat_tokens_span(
+            dummy, mask_ratio, span_length, mask_token_id=0,
+            cross_lead_aligned=cross_lead_aligned,
+        )
     masked_rr = rr_feats.clone()
     masked_rr[mask] = 0.0
     return masked_rr, mask
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 3. Lead dropout
-# ──────────────────────────────────────────────────────────────────────────────
-
+# -----------------------------------------------------------------------------
+# Lead dropout
+# -----------------------------------------------------------------------------
 def lead_dropout(
     indices: torch.Tensor,
     rr_feats: torch.Tensor,
@@ -139,23 +139,31 @@ def lead_dropout(
     mask_token_id: int = 512,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    리드 단위로 전체 비트를 마스킹.
+    Drop entire leads across all beats. Per-(batch, lead) independent
+    Bernoulli(dropout_prob), with `min_leads` kept per sample. The expected
+    number of dropped leads is `L * dropout_prob`.
 
-    Returns:
-        masked_indices  : (B, N, L)
-        masked_rr       : (B, N, L, 3)
-        lead_mask       : (B, L) bool — True = dropped lead
+    The caller is responsible for also zeroing the corresponding lead
+    channels in the STFT input passed to the model — otherwise the global
+    context CNN leaks information from dropped leads.
+
+    Returns (masked_indices, masked_rr, lead_mask=(B, L) True for dropped).
     """
     B, N, L = indices.shape
-    lead_mask = torch.zeros(B, L, dtype=torch.bool, device=indices.device)
 
-    if dropout_prob > 0:
-        for b in range(B):
-            n_drop = max(0, int(torch.rand(1).item() * L * dropout_prob))
-            n_drop = min(n_drop, L - min_leads)
-            if n_drop > 0:
-                perm = torch.randperm(L, device=indices.device)[:n_drop]
-                lead_mask[b, perm] = True
+    if dropout_prob <= 0:
+        lead_mask = torch.zeros(B, L, dtype=torch.bool, device=indices.device)
+    else:
+        drop = torch.rand(B, L, device=indices.device) < dropout_prob
+        max_drop = max(0, L - min_leads)
+        n_dropped = drop.sum(dim=1)
+        overflow_rows = (n_dropped > max_drop).nonzero(as_tuple=True)[0]
+        for b in overflow_rows.tolist():
+            dropped_idx = drop[b].nonzero(as_tuple=True)[0]
+            n_un = int(n_dropped[b].item()) - max_drop
+            perm = torch.randperm(dropped_idx.numel(), device=indices.device)[:n_un]
+            drop[b, dropped_idx[perm]] = False
+        lead_mask = drop
 
     masked_indices = indices.clone()
     masked_rr = rr_feats.clone()
@@ -165,10 +173,9 @@ def lead_dropout(
     return masked_indices, masked_rr, lead_mask
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# B-4: Lead-dropout curriculum helper
-# ──────────────────────────────────────────────────────────────────────────────
-
+# -----------------------------------------------------------------------------
+# Lead dropout curriculum
+# -----------------------------------------------------------------------------
 def lead_dropout_schedule(
     epoch: int,
     max_prob: float,
@@ -176,12 +183,11 @@ def lead_dropout_schedule(
     warmup_epochs: int = 50,
 ) -> float:
     """
-    Returns lead_dropout_prob for the given epoch.
+    Per-epoch lead-dropout probability.
 
-    schedule:
-      - "constant": always max_prob (legacy 호환)
-      - "linear":   0 at epoch 1 → max_prob at epoch (warmup_epochs+1) → constant
-      - "cosine":   0 → max_prob smoothly via 1 - 0.5*(1+cos(pi*t/W))
+      schedule="constant": always max_prob.
+      schedule="linear":   0 at epoch 1 -> max_prob at epoch warmup_epochs+1.
+      schedule="cosine":   0 -> max_prob via half-cosine over warmup_epochs.
     """
     if schedule == "constant":
         return float(max_prob)
@@ -198,57 +204,58 @@ def lead_dropout_schedule(
     raise ValueError(f"unknown lead_dropout schedule: {schedule}")
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Combined masking for one training step
-# ──────────────────────────────────────────────────────────────────────────────
-
+# -----------------------------------------------------------------------------
+# Combined masking
+# -----------------------------------------------------------------------------
 def apply_masking(
     indices: torch.Tensor,
     rr_feats: torch.Tensor,
     beat_mask_ratio: float = 0.5,
     rhythm_mask_ratio: float = 0.5,
-    span_length: int = 3,                    # 1=i.i.d. (legacy), >=2=span
+    span_length: int = 3,
     lead_dropout_prob: float = 0.0,
     lead_min_leads: int = 1,
     mask_token_id: int = 512,
-    mask_strategy: str = "span",             # "iid" | "span"
+    mask_strategy: str = "span",
+    cross_lead_aligned: bool = True,
 ) -> dict:
     """
-    Apply masking pipeline:
-      1. lead dropout (lead 단위 전체 제거)
-      2. beat token masking (span or iid)
-      3. rhythm feature masking (span or iid; beat masking과 같은 strategy)
+    Full masking pipeline:
+      1. lead_dropout
+      2. beat token masking (span | iid), aligned across leads by default
+      3. rhythm masking (mirrors the beat strategy and alignment)
+
+    Returns a dict with masked tensors and the three masks for loss compute.
     """
-    # 1. lead dropout
     idx, rr, lead_mask = lead_dropout(
         indices, rr_feats, lead_dropout_prob, lead_min_leads, mask_token_id
     )
 
-    # 2. beat token masking
     if mask_strategy == "iid":
         idx, beat_mask = mask_beat_tokens_iid(idx, beat_mask_ratio, mask_token_id)
         rhythm_span = 1
     elif mask_strategy == "span":
         idx, beat_mask = mask_beat_tokens_span(
             idx, beat_mask_ratio, span_length, mask_token_id,
+            cross_lead_aligned=cross_lead_aligned,
         )
         rhythm_span = span_length
     else:
         raise ValueError(f"unknown mask_strategy: {mask_strategy}")
 
-    # 3. rhythm masking (independently sampled, same strategy)
-    rr, rhythm_mask = mask_rhythm_features(rr, rhythm_mask_ratio, span_length=rhythm_span)
+    rr, rhythm_mask = mask_rhythm_features(
+        rr, rhythm_mask_ratio, span_length=rhythm_span,
+        cross_lead_aligned=cross_lead_aligned,
+    )
 
     return {
-        "masked_indices":   idx,
-        "masked_rr_feats":  rr,
-        "beat_mask":        beat_mask,
-        "rhythm_mask":      rhythm_mask,
-        "lead_mask":        lead_mask,
+        "masked_indices":  idx,
+        "masked_rr_feats": rr,
+        "beat_mask":       beat_mask,
+        "rhythm_mask":     rhythm_mask,
+        "lead_mask":       lead_mask,
     }
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Backwards-compat alias — older code/tests may import mask_beat_tokens directly
-# ──────────────────────────────────────────────────────────────────────────────
+# Backwards-compat alias for callers that imported the old name directly.
 mask_beat_tokens = mask_beat_tokens_iid
