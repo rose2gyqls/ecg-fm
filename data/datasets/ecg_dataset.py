@@ -31,7 +31,10 @@ import torch
 from torch.utils.data import Dataset
 
 from data.preprocessing.beat_segmentor import process_ecg_record
-from data.preprocessing.resampler      import resample_beat, normalize_beat
+from data.preprocessing.resampler      import (
+    resample_beat, normalize_beat,
+    compute_record_norm_stats, apply_record_norm,
+)
 from data.preprocessing.stft_extractor import compute_stft_map
 
 
@@ -49,6 +52,13 @@ class ECGDataset(Dataset):
         self.n_leads     = cfg.get("n_leads", 12)
         self.stft_n_fft  = cfg.get("stft_n_fft", 256)
         self.stft_hop    = cfg.get("stft_hop", 64)
+
+        # Normalization mode (must match tokenizer training):
+        #   "record_mad" | "zscore" | "none". Default record_mad.
+        self.normalize = cfg.get("normalize", "record_mad")
+        self.record_mad_scale = float(cfg.get("record_mad_scale", 5.0))
+        if self.normalize not in ("record_mad", "zscore", "none"):
+            raise ValueError(f"unknown normalize mode: {self.normalize}")
 
         data_dir = os.path.join(cfg["data_dir"], split)
         self.files = sorted(
@@ -110,13 +120,22 @@ class ECGDataset(Dataset):
         rr_feats  = result["rr_feats"]   # list of N dicts
 
         # ── Resample + normalize each beat ───────────────────────────────────
+        # Record-level stats from the raw 12-lead signal so V1 and V6 keep
+        # their relative amplitudes (record_mad mode).
+        if self.normalize == "record_mad":
+            rec_med, rec_mad = compute_record_norm_stats(signal)
+
         N = beats_raw.shape[0]
         beats_proc = np.zeros((N, self.n_leads, self.beat_length), dtype=np.float32)
         for b in range(N):
             for l in range(self.n_leads):
                 seg = beats_raw[b, l, :]
                 seg = resample_beat(seg, self.beat_length)
-                seg = normalize_beat(seg[np.newaxis], "zscore")[0]
+                if self.normalize == "zscore":
+                    seg = normalize_beat(seg[np.newaxis], "zscore")[0]
+                elif self.normalize == "record_mad":
+                    seg = apply_record_norm(seg, rec_med, rec_mad,
+                                            scale=self.record_mad_scale)
                 beats_proc[b, l, :] = seg
 
         # ── Pad / trim to max_beats ──────────────────────────────────────────

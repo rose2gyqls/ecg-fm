@@ -44,3 +44,38 @@ def normalize_beat(beat: np.ndarray, method: str = "zscore") -> np.ndarray:
         mx = beat.max(axis=-1, keepdims=True)
         return (beat - mn) / (mx - mn + 1e-8)
     return beat
+
+
+# ── Record-level robust normalization (preserves inter-lead amplitude) ──────
+# Per-record (median, robust-scale) once for the whole (12, T) signal so that
+# V1 vs V6 amplitude differences survive into the codebook input. Per-beat
+# z-score erases that.
+#
+# Note on the scale estimator: classical MAD (median of |sig − median|)
+# degenerates to ~0 on raw ECG because the long isoelectric baseline puts
+# most samples near the median (heedb is also heavily quantized via float16
+# storage). We use the 75th percentile of |sig − median| instead — still
+# robust to outliers, but non-degenerate as long as the signal has any
+# diagnostic content. For a clean Gaussian, p75/0.6745 ≈ σ, so a beat with
+# QRS amplitude ~1 mV ends up at ~`1 mV / (scale · p75)` ≈ a few units.
+
+def compute_record_norm_stats(
+    signal: np.ndarray, eps: float = 1e-6, percentile: float = 75.0
+) -> tuple[float, float]:
+    """Global median and percentile-based robust scale over (lead, time)."""
+    median = float(np.median(signal))
+    scale = float(np.percentile(np.abs(signal - median), percentile)) + eps
+    return median, scale
+
+
+def apply_record_norm(
+    x: np.ndarray, median: float, robust_scale: float, scale: float = 5.0
+) -> np.ndarray:
+    """Apply record-level (median, robust_scale)·scale normalization.
+
+    `robust_scale` is the value returned by `compute_record_norm_stats`
+    (75th percentile of |sig − median| by default). `scale` is an additional
+    multiplier so that the normalized output sits in roughly ±1 for typical
+    diagnostic content.
+    """
+    return ((x - median) / (scale * robust_scale)).astype(np.float32)

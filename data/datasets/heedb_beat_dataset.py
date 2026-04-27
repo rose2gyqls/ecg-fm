@@ -26,6 +26,7 @@ from data.preprocessing.beat_segmentor import (
 )
 from data.preprocessing.resampler      import (
     resample_signal, resample_beat, normalize_beat,
+    compute_record_norm_stats, apply_record_norm,
 )
 
 
@@ -40,7 +41,11 @@ class HEEDBBeatDataset(Dataset):
         beat_length     : 256
         before_ms       : 200
         after_ms        : 400
-        normalize       : "zscore"
+        normalize       : "record_mad" | "zscore" | "none"
+                          - record_mad: per-record (median, MAD)·5 scaling.
+                            Preserves inter-lead amplitude (V1 vs V6).
+                          - zscore   : per-beat per-lead z-score (legacy).
+                          - none     : no normalization.
         max_beats_per_record : int, 레코드당 최대 사용 비트 (랜덤 샘플)
         cache           : True이면 첫 epoch에 메모리로 비트 캐시
     """
@@ -50,7 +55,10 @@ class HEEDBBeatDataset(Dataset):
         self.beat_length = int(cfg.get("beat_length", 256))
         self.before_ms   = int(cfg.get("before_ms", 200))
         self.after_ms    = int(cfg.get("after_ms", 400))
-        self.normalize   = cfg.get("normalize", "zscore")
+        self.normalize   = cfg.get("normalize", "record_mad")
+        self.record_mad_scale = float(cfg.get("record_mad_scale", 5.0))
+        if self.normalize not in ("record_mad", "zscore", "none"):
+            raise ValueError(f"unknown normalize mode: {self.normalize}")
         self.max_per_rec = int(cfg.get("max_beats_per_record", 10))
         self.cache_mode  = bool(cfg.get("cache", False))
 
@@ -147,7 +155,7 @@ class HEEDBBeatDataset(Dataset):
             return None
         beats = np.stack(beats_arr, axis=0)              # (N, 12, W_raw)
 
-        # 3) noise/flat beat 필터 — (beat, lead) 단위로 drop
+        # 3) noise/flat beat 필터 — (beat, lead) 단위로 drop. raw mV thresholds.
         N, L, W = beats.shape
         beats = beats.reshape(N * L, W)                  # (N*12, W_raw)
         if self.nf_enabled:
@@ -157,6 +165,13 @@ class HEEDBBeatDataset(Dataset):
             beats = beats[~flat]
         if beats.shape[0] == 0:
             return None
+
+        # 4) record-level normalization (mode=="record_mad"): apply ONCE using
+        #    record-level (median, MAD) computed on the full (12, T) raw signal.
+        #    Per-beat z-score happens later in __getitem__ for mode=="zscore".
+        if self.normalize == "record_mad":
+            med, mad = compute_record_norm_stats(signal)
+            beats = apply_record_norm(beats, med, mad, scale=self.record_mad_scale)
 
         # 레코드당 비트 수 제한 (랜덤, lead-flattened 이후에 적용)
         limit = self.max_per_rec * L if self.max_per_rec else beats.shape[0]
@@ -191,7 +206,12 @@ class HEEDBBeatDataset(Dataset):
                 beat = self._buf[self._buf_idx].copy()
                 self._buf_idx += 1
 
-        beat = normalize_beat(beat[np.newaxis], self.normalize)  # (1, W)
+        # If mode=="record_mad", normalization was already applied in
+        # _extract_record_beats. Only z-score needs per-beat application here.
+        if self.normalize == "zscore":
+            beat = normalize_beat(beat[np.newaxis], "zscore")  # (1, W)
+        else:
+            beat = beat[np.newaxis]
         return {"beat": torch.from_numpy(beat.astype(np.float32))}
 
     def _refill_buffer(self):

@@ -18,6 +18,7 @@ from data.preprocessing.beat_segmentor import (
 )
 from data.preprocessing.resampler      import (
     resample_signal, resample_beat, normalize_beat,
+    compute_record_norm_stats, apply_record_norm,
 )
 from data.preprocessing.stft_extractor import compute_stft_map
 
@@ -39,6 +40,15 @@ class HEEDBECGDataset(Dataset):
         fid_cfg = cfg.get("fiducial", {}) or {}
         self.fid_q_window_ms = int(fid_cfg.get("q_window_ms", 50))
         self.fid_s_window_ms = int(fid_cfg.get("s_window_ms", 80))
+
+        # Normalization mode (must match tokenizer training).
+        #   "record_mad": per-record (median, MAD)·5 — preserves V1↔V6 amp.
+        #   "zscore"   : per-beat per-lead z-score (legacy v1/v2).
+        #   "none"     : no normalization.
+        self.normalize = cfg.get("normalize", "record_mad")
+        self.record_mad_scale = float(cfg.get("record_mad_scale", 5.0))
+        if self.normalize not in ("record_mad", "zscore", "none"):
+            raise ValueError(f"unknown normalize mode: {self.normalize}")
 
         # 1) split별 파일 리스트 (train_list / val_list) 우선 — Phase 1과 동일한
         #    subset을 그대로 재사용해서 train/val 누수 방지
@@ -117,12 +127,22 @@ class HEEDBECGDataset(Dataset):
         rr_feats = compute_rr_features(rpeaks, fs)
 
         # resample + normalize
+        # Record-level stats computed ONCE on the raw 12-lead signal so all
+        # beats from this record share the same scale (preserves V1 vs V6).
+        if self.normalize == "record_mad":
+            rec_med, rec_mad = compute_record_norm_stats(signal)
+
         N = beats_raw.shape[0]
         beats_proc = np.zeros((N, self.n_leads, self.beat_length), dtype=np.float32)
         for b in range(N):
             for l in range(self.n_leads):
                 seg = resample_beat(beats_raw[b, l, :], self.beat_length)
-                beats_proc[b, l, :] = normalize_beat(seg[np.newaxis], "zscore")[0]
+                if self.normalize == "zscore":
+                    seg = normalize_beat(seg[np.newaxis], "zscore")[0]
+                elif self.normalize == "record_mad":
+                    seg = apply_record_norm(seg, rec_med, rec_mad,
+                                            scale=self.record_mad_scale)
+                beats_proc[b, l, :] = seg
 
         # pad/trim
         if N >= self.max_beats:

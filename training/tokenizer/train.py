@@ -193,6 +193,14 @@ def train(cfg: dict, resume: str | None = None):
     )
 
     # ---------- Model ----------
+    # Persist data-pipeline contract on the checkpoint so downstream consumers
+    # can self-describe (which normalization the tokenizer was trained with).
+    cfg["model"].setdefault(
+        "normalize", cfg["data"].get("normalize", "record_mad")
+    )
+    cfg["model"].setdefault(
+        "record_mad_scale", float(cfg["data"].get("record_mad_scale", 5.0))
+    )
     model = VQVAE(cfg["model"]).to(device)
     if is_main:
         print(f"[Tokenizer] Parameters: {sum(p.numel() for p in model.parameters()):,}")

@@ -61,9 +61,9 @@ model:
 masking:
   # ★ B-2: span 마스킹 (인접 3 beat 묶음), 비율 0.5
   mask_strategy: span                   # span | iid
-  span_length: 3
-  beat_mask_ratio: 0.5                  # ★ v2: 0.15 → 0.5
-  rhythm_mask_ratio: 0.5                # 동일 strategy로 따라감
+  span_length: 10                       # ★ leak-fix Phase D: 3 → 10 (time-axis copy 차단)
+  beat_mask_ratio: 0.8                  # ★ leak-fix Phase D: 0.5 → 0.8 (MAE-style)
+  rhythm_mask_ratio: 0.8                # ★ leak-fix Phase D: 0.5 → 0.8 (beat과 동일)
 
   # ★ B-4: linear curriculum 0 → 0.2 over 50 epochs
   lead_dropout_prob: 0.4                # ★ leak-fix: 0.2 → 0.4 (per-lead Bernoulli)
@@ -87,6 +87,7 @@ training:
     morphology_weight: 1.0
     rhythm_weight: 1.0                  # ★ v2: 0.5 → 1.0 (target z-score라 더 키워도 안전)
     fiducial_weight: 1.0                # ★ v2: 5.0 → 1.0 (target z-score 했으므로 dominant 지양)
+    class_balanced_alpha: 0.5           # ★ leak-fix Phase E: 0=disable, freq^-alpha 가중. dominant code 학습 가중치 ↓
 
   log_dir:  logs/pretrain_heedb_cb512_v2
   tb_dir:   logs/tb/pretrain/cb512_v2

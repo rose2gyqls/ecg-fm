@@ -41,6 +41,12 @@ class BeatDataset(Dataset):
     def __init__(self, cfg: dict, split: str = "train"):
         self.beat_length = cfg.get("beat_length", 256)
         self.normalize   = cfg.get("normalize", "zscore")
+        if self.normalize == "record_mad":
+            raise ValueError(
+                "BeatDataset (file-based) cannot apply record_mad — record "
+                "metadata is lost once beats are flattened into .npy/.h5. "
+                "Use HEEDBBeatDataset (streaming from raw h5) instead."
+            )
 
         data_dir = os.path.join(cfg["data_dir"], split)
         files    = sorted(glob.glob(os.path.join(data_dir, "*.npy")))

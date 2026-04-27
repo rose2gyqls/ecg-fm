@@ -31,6 +31,7 @@ from torch.utils.tensorboard import SummaryWriter
 from models.tokenizer.vqvae import VQVAE
 from models.transformer.ecg_model import ECGFoundationModel
 from models.heads.mlm_head import MaskedBeatModelingHead, MaskedRhythmHead, MaskedFiducialHead
+from models.heads.contrastive_head import ProjectionHead, nt_xent_loss
 from training.pretrain.masking import apply_masking, lead_dropout_schedule
 from utils.checkpointing import save_checkpoint
 from utils.logging_utils import MetricLogger
@@ -92,6 +93,22 @@ def train(cfg: dict, resume: str | None = None):
     model_cfg["codebook_size"] = int(cfg["tokenizer"]["codebook_size"])
     model_cfg["n_leads"]       = int(cfg["data"].get("n_leads", 12))
     model_cfg["max_beats"]     = int(cfg["data"].get("max_beats_per_lead", 15))
+    # Persist normalization mode so downstream consumers (ECGFMHBEncoder etc.)
+    # can self-describe the input contract from the checkpoint alone.
+    model_cfg["normalize"]        = cfg["data"].get("normalize", "record_mad")
+    model_cfg["record_mad_scale"] = float(cfg["data"].get("record_mad_scale", 5.0))
+
+    # Record the contrastive head spec so a finetune adapter can re-instantiate
+    # the projection head if it wants to (e.g. for similarity-based retrieval).
+    _ctr_cfg_persist = cfg.get("training", {}).get("contrastive", {}) or {}
+    if float(_ctr_cfg_persist.get("weight", 0.0)) > 0:
+        model_cfg["contrastive"] = {
+            "proj_hidden": int(_ctr_cfg_persist.get(
+                "proj_hidden", int(cfg["model"]["d_model"]))),
+            "proj_out":    int(_ctr_cfg_persist.get("proj_out", 128)),
+            "temperature": float(_ctr_cfg_persist.get("temperature", 0.1)),
+            "weight":      float(_ctr_cfg_persist.get("weight", 0.0)),
+        }
 
     # If the data config provides RR normalization stats, propagate them into
     # context so RhythmMLP registers them as buffers (and downstream encoders
@@ -115,9 +132,28 @@ def train(cfg: dict, resume: str | None = None):
     rr_head  = MaskedRhythmHead(d_model=int(cfg["model"]["d_model"])).to(device)
     fid_head = MaskedFiducialHead(d_model=int(cfg["model"]["d_model"])).to(device)
 
+    # SimCLR-style contrastive auxiliary head. Built unconditionally so the
+    # parameter set is identical across configs; the loss is gated below by
+    # contrastive_weight (= 0 → no-op, identical to legacy training).
+    ctr_cfg = cfg.get("training", {}).get("contrastive", {}) or {}
+    ctr_proj_hidden = int(ctr_cfg.get("proj_hidden", int(cfg["model"]["d_model"])))
+    ctr_proj_out    = int(ctr_cfg.get("proj_out", 128))
+    ctr_temperature = float(ctr_cfg.get("temperature", 0.1))
+    ctr_w_max       = float(ctr_cfg.get("weight", 0.0))
+    ctr_warmup      = int(ctr_cfg.get("warmup_epochs", 0))
+    proj_head = ProjectionHead(
+        d_in=int(cfg["model"]["d_model"]),
+        d_hidden=ctr_proj_hidden,
+        d_out=ctr_proj_out,
+    ).to(device)
+    if is_main:
+        print(f"[Pretrain] contrastive: weight={ctr_w_max} τ={ctr_temperature} "
+              f"proj={ctr_proj_hidden}->{ctr_proj_out} warmup={ctr_warmup}ep")
+
     if ddp:
         # find_unused_parameters=True covers the case where masking/dropout
         # leaves some head with no contributing positions in a given step.
+        # Also covers the proj_head being unused when contrastive_weight=0.
         model    = DDP(model, device_ids=[local_rank], output_device=local_rank,
                        broadcast_buffers=False, find_unused_parameters=True)
         mlm_head = DDP(mlm_head, device_ids=[local_rank], output_device=local_rank,
@@ -126,15 +162,19 @@ def train(cfg: dict, resume: str | None = None):
                        find_unused_parameters=True)
         fid_head = DDP(fid_head, device_ids=[local_rank], output_device=local_rank,
                        find_unused_parameters=True)
-    raw_model    = model.module    if ddp else model
-    raw_mlm_head = mlm_head.module if ddp else mlm_head
-    raw_rr_head  = rr_head.module  if ddp else rr_head
-    raw_fid_head = fid_head.module if ddp else fid_head
+        proj_head = DDP(proj_head, device_ids=[local_rank], output_device=local_rank,
+                        find_unused_parameters=True)
+    raw_model     = model.module     if ddp else model
+    raw_mlm_head  = mlm_head.module  if ddp else mlm_head
+    raw_rr_head   = rr_head.module   if ddp else rr_head
+    raw_fid_head  = fid_head.module  if ddp else fid_head
+    raw_proj_head = proj_head.module if ddp else proj_head
 
     params = (list(model.parameters()) +
               list(mlm_head.parameters()) +
               list(rr_head.parameters()) +
-              list(fid_head.parameters()))
+              list(fid_head.parameters()) +
+              list(proj_head.parameters()))
     if is_main:
         print(f"[Pretrain] Parameters: {sum(p.numel() for p in params):,}")
 
@@ -262,6 +302,8 @@ def train(cfg: dict, resume: str | None = None):
             raw_rr_head.load_state_dict(ck["rr_head"])
         if "fid_head" in ck:
             raw_fid_head.load_state_dict(ck["fid_head"])
+        if "proj_head" in ck:
+            raw_proj_head.load_state_dict(ck["proj_head"])
         if "optimizer" in ck:
             opt.load_state_dict(ck["optimizer"])
         if "scheduler" in ck:
@@ -272,6 +314,65 @@ def train(cfg: dict, resume: str | None = None):
         if is_main:
             print(f"[Resume] Loaded {resume}  -> start_epoch={start_epoch}  "
                   f"best_val_loss={best_val_loss:.4f}", flush=True)
+
+    # ---------- Class-balanced CE weights (Phase E) ----------
+    # Tokenizer codebooks are heavily skewed (top-1 code can hold 60%+ of all
+    # tokens), so plain CE collapses to "predict the dominant code". Inverse-
+    # frequency weighting (freq^-alpha) raises the gradient on rare codes.
+    cb_alpha = float(loss_cfg.get("class_balanced_alpha", 0.0))
+    K = mask_token_id  # = codebook_size
+    ce_weight = None
+    top1_token_id = None
+    if cb_alpha > 0:
+        freq_path = os.path.join(ckpt_dir, f"codebook_freq_K{K}.pt")
+        if os.path.exists(freq_path):
+            freq = torch.load(freq_path, map_location=device)["freq"].to(device)
+            if is_main:
+                print(f"[Pretrain] codebook freq loaded from {freq_path}")
+        else:
+            if is_main:
+                print(f"[Pretrain] computing codebook freq on training subset...")
+            counts = torch.zeros(K, dtype=torch.long, device=device)
+            target_records = 2000
+            per_rank_target = max(target_records // max(world_size, 1), 64)
+            seen = 0
+            for batch in train_loader:
+                beats = batch["beats"].to(device, non_blocking=True)
+                Bb, Nb, Lb, Wb = beats.shape
+                with torch.no_grad():
+                    _, idx_flat = tokenizer.encode(beats.view(Bb * Nb * Lb, 1, Wb))
+                counts += torch.bincount(idx_flat, minlength=K)
+                seen += Bb
+                if seen >= per_rank_target:
+                    break
+            if ddp:
+                dist.all_reduce(counts, op=dist.ReduceOp.SUM)
+                seen_t = torch.tensor([seen], device=device)
+                dist.all_reduce(seen_t, op=dist.ReduceOp.SUM)
+                seen_total = int(seen_t.item())
+            else:
+                seen_total = seen
+            freq = counts.float() / counts.sum().clamp(min=1)
+            if is_main:
+                torch.save({"freq": freq.cpu(), "n_records": seen_total}, freq_path)
+                print(f"[Pretrain] codebook freq saved → {freq_path}  "
+                      f"(records={seen_total}, top-1={freq.max().item():.3f})")
+            if ddp:
+                dist.barrier()
+        ce_weight = (freq + 1e-8).pow(-cb_alpha)
+        ce_weight = ce_weight / ce_weight.mean()
+        # Clamp to prevent rare-code gradient explosion: a freq~0 code yields
+        # huge raw weight, and a single sample of it can dominate a batch.
+        clamp_max = float(loss_cfg.get("class_balanced_clamp_max", 10.0))
+        clamp_min = float(loss_cfg.get("class_balanced_clamp_min", 0.01))
+        ce_weight = ce_weight.clamp(min=clamp_min, max=clamp_max)
+        ce_weight = ce_weight / ce_weight.mean()
+        top1_token_id = int(freq.argmax().item())
+        if is_main:
+            print(f"[Pretrain] class-balanced CE: alpha={cb_alpha}  "
+                  f"weight=[{ce_weight.min().item():.3f}, {ce_weight.max().item():.3f}]  "
+                  f"clamp=[{clamp_min}, {clamp_max}]  "
+                  f"top-1 code id={top1_token_id} ({freq.max().item()*100:.1f}%)")
 
     t_global = time.time()
 
@@ -286,6 +387,72 @@ def train(cfg: dict, resume: str | None = None):
             mask_token_id=mask_token_id,
             mask_strategy=mask_strategy,
         )
+
+    def _compute_view(masked, indices, rr_feats, fid_feats, stft, B, N, L):
+        """One forward + MLM/RR/fid losses + CLS for one masked view.
+
+        Returns dict with float tensors for losses and the (B, d) CLS output.
+        Diagnostic acc / acc_nontop are returned as Python floats.
+        """
+        stft_in = stft * (~masked["lead_mask"]).to(stft.dtype).view(B, L, 1, 1)
+        out = model(masked["masked_indices"], masked["masked_rr_feats"], stft_in)
+        cls       = out[:, 0, :]
+        token_out = out[:, 1:, :].view(B, N, L, -1)
+
+        beat_mask = masked["beat_mask"]
+        if beat_mask.any():
+            hidden_masked = token_out[beat_mask]
+            logits_mlm = mlm_head(hidden_masked)
+            targets    = indices[beat_mask]
+            loss_mlm   = F.cross_entropy(logits_mlm, targets, weight=ce_weight)
+            with torch.no_grad():
+                pred = logits_mlm.argmax(-1)
+                acc = (pred == targets).float().mean().item()
+                if top1_token_id is not None:
+                    nt = targets != top1_token_id
+                    acc_nontop = (pred[nt] == targets[nt]).float().mean().item() if nt.any() else 0.0
+                else:
+                    acc_nontop = acc
+            if fid_w > 0:
+                pred_fid = fid_head(hidden_masked)
+                true_fid = _normalize_target(fid_feats[beat_mask], fid_mean_t, fid_std_t)
+                loss_fid = F.mse_loss(pred_fid, true_fid)
+            else:
+                loss_fid = torch.tensor(0.0, device=device)
+        else:
+            loss_mlm = torch.tensor(0.0, device=device)
+            loss_fid = torch.tensor(0.0, device=device)
+            acc, acc_nontop = 0.0, 0.0
+
+        rr_mask = masked["rhythm_mask"]
+        if rr_mask.any():
+            pred_rr = rr_head(token_out[rr_mask])
+            true_rr = _normalize_target(rr_feats[rr_mask], rr_mean_t, rr_std_t)
+            loss_rr = F.mse_loss(pred_rr, true_rr)
+        else:
+            loss_rr = torch.tensor(0.0, device=device)
+
+        return {
+            "cls":       cls,
+            "loss_mlm":  loss_mlm,
+            "loss_rr":   loss_rr,
+            "loss_fid":  loss_fid,
+            "acc":       acc,
+            "acc_nontop": acc_nontop,
+        }
+
+    def _contrastive_weight(epoch: int) -> float:
+        """Linear warmup of contrastive weight: 0 at ep1, ctr_w_max at warmup+1."""
+        if ctr_w_max <= 0 or ctr_warmup <= 0:
+            return float(ctr_w_max)
+        t = max(0, epoch - 1)
+        if t >= ctr_warmup:
+            return float(ctr_w_max)
+        return float(ctr_w_max) * (t / ctr_warmup)
+
+    two_view = (ctr_w_max > 0)
+    if is_main and two_view:
+        print("[Pretrain] two-view forward enabled (contrastive auxiliary loss active)")
 
     for epoch in range(start_epoch, max_epochs + 1):
         if ddp and train_sampler is not None:
@@ -303,10 +470,14 @@ def train(cfg: dict, resume: str | None = None):
 
         # ---------- Train ----------
         model.train(); mlm_head.train(); rr_head.train(); fid_head.train()
+        proj_head.train()
         t_epoch = time.time()
         running = {"loss": 0.0, "loss_mlm": 0.0, "loss_rr": 0.0,
-                   "loss_fid": 0.0, "acc": 0.0}
+                   "loss_fid": 0.0, "loss_ctr": 0.0,
+                   "acc": 0.0, "acc_nontop": 0.0,
+                   "ctr_pos_sim": 0.0, "ctr_neg_sim": 0.0, "ctr_acc": 0.0}
         n_steps = 0
+        cur_ctr_w = _contrastive_weight(epoch)
 
         pbar = tqdm(
             train_loader,
@@ -331,44 +502,39 @@ def train(cfg: dict, resume: str | None = None):
                 _, idx_flat = tokenizer.encode(beats.view(B * N * L, 1, W))
             indices = idx_flat.view(B, N, L)
 
-            masked = _apply_mask(indices, rr_feats, cur_lead_dropout)
+            # ── View 1 (always) ────────────────────────────────────────────
+            masked1 = _apply_mask(indices, rr_feats, cur_lead_dropout)
+            v1 = _compute_view(masked1, indices, rr_feats, fid_feats, stft, B, N, L)
 
-            stft_in = stft * (~masked["lead_mask"]).to(stft.dtype).view(B, L, 1, 1)
+            if two_view:
+                # ── View 2: independent masking on the same record ─────────
+                masked2 = _apply_mask(indices, rr_feats, cur_lead_dropout)
+                v2 = _compute_view(masked2, indices, rr_feats, fid_feats, stft, B, N, L)
 
-            out = model(masked["masked_indices"], masked["masked_rr_feats"], stft_in)
-            token_out = out[:, 1:, :].view(B, N, L, -1)
+                loss_mlm = 0.5 * (v1["loss_mlm"] + v2["loss_mlm"])
+                loss_rr  = 0.5 * (v1["loss_rr"]  + v2["loss_rr"])
+                loss_fid = 0.5 * (v1["loss_fid"] + v2["loss_fid"])
+                acc        = 0.5 * (v1["acc"]        + v2["acc"])
+                acc_nontop = 0.5 * (v1["acc_nontop"] + v2["acc_nontop"])
 
-            beat_mask = masked["beat_mask"]
-            if beat_mask.any():
-                hidden_masked = token_out[beat_mask]
-                logits_mlm = mlm_head(hidden_masked)
-                targets    = indices[beat_mask]
-                loss_mlm   = F.cross_entropy(logits_mlm, targets)
-                with torch.no_grad():
-                    acc = (logits_mlm.argmax(-1) == targets).float().mean().item()
-
-                # Fiducial (Q-R, R-S) regression on the same masked positions.
-                # Target is z-scored so the MSE has a meaningful magnitude.
-                if fid_w > 0:
-                    pred_fid = fid_head(hidden_masked)
-                    true_fid = _normalize_target(fid_feats[beat_mask], fid_mean_t, fid_std_t)
-                    loss_fid = F.mse_loss(pred_fid, true_fid)
-                else:
-                    loss_fid = torch.tensor(0.0, device=device)
+                # SimCLR-style NT-Xent on projected CLS embeddings.
+                z1 = proj_head(v1["cls"])
+                z2 = proj_head(v2["cls"])
+                loss_ctr, ctr_stats = nt_xent_loss(
+                    z1, z2,
+                    temperature=ctr_temperature,
+                    gather_distributed=ddp,
+                )
             else:
-                loss_mlm = torch.tensor(0.0, device=device)
-                loss_fid = torch.tensor(0.0, device=device)
-                acc = 0.0
+                loss_mlm = v1["loss_mlm"]; loss_rr = v1["loss_rr"]; loss_fid = v1["loss_fid"]
+                acc = v1["acc"]; acc_nontop = v1["acc_nontop"]
+                loss_ctr = torch.tensor(0.0, device=device)
+                ctr_stats = {"ctr_pos_sim": 0.0, "ctr_neg_sim": 0.0, "ctr_acc": 0.0}
 
-            rr_mask = masked["rhythm_mask"]
-            if rr_mask.any():
-                pred_rr = rr_head(token_out[rr_mask])
-                true_rr = _normalize_target(rr_feats[rr_mask], rr_mean_t, rr_std_t)
-                loss_rr = F.mse_loss(pred_rr, true_rr)
-            else:
-                loss_rr = torch.tensor(0.0, device=device)
-
-            loss = morph_w * loss_mlm + rhythm_w * loss_rr + fid_w * loss_fid
+            loss = (morph_w   * loss_mlm
+                    + rhythm_w * loss_rr
+                    + fid_w    * loss_fid
+                    + cur_ctr_w * loss_ctr)
 
             opt.zero_grad()
             loss.backward()
@@ -381,7 +547,12 @@ def train(cfg: dict, resume: str | None = None):
                     "loss_mlm": loss_mlm.item(),
                     "loss_rr":  loss_rr.item(),
                     "loss_fid": loss_fid.item(),
+                    "loss_ctr": loss_ctr.item(),
                     "acc":      acc,
+                    "acc_nontop": acc_nontop,
+                    "ctr_pos_sim": ctr_stats["ctr_pos_sim"],
+                    "ctr_neg_sim": ctr_stats["ctr_neg_sim"],
+                    "ctr_acc":     ctr_stats["ctr_acc"],
                 }
                 for k, v in vals.items():
                     running[k] += v
@@ -390,13 +561,17 @@ def train(cfg: dict, resume: str | None = None):
                 logger.update(split="train", epoch=epoch, **vals)
                 for k, v in vals.items():
                     tb.add_scalar(f"train/{k}", v, global_step)
+                tb.add_scalar("train/ctr_weight", cur_ctr_w, global_step)
                 if n_steps % 20 == 0:
                     pbar.set_postfix({
                         "loss": f"{running['loss']/n_steps:.3f}",
                         "mlm":  f"{running['loss_mlm']/n_steps:.3f}",
                         "rr":   f"{running['loss_rr']/n_steps:.3f}",
                         "fid":  f"{running['loss_fid']/n_steps:.4f}",
+                        "ctr":  f"{running['loss_ctr']/n_steps:.3f}",
                         "acc":  f"{running['acc']/n_steps:.3f}",
+                        "acc_nt": f"{running['acc_nontop']/n_steps:.3f}",
+                        "c_acc": f"{running['ctr_acc']/n_steps:.3f}",
                     })
         pbar.close()
         scheduler.step()
@@ -410,11 +585,13 @@ def train(cfg: dict, resume: str | None = None):
             elapsed       = time.time() - t_epoch
             total_elapsed = time.time() - t_global
             eta           = elapsed * (max_epochs - epoch)
+            ctr_str = (f"  ctr={avg['loss_ctr']:.3f}(w={cur_ctr_w:.2f}) "
+                       f"c_acc={avg['ctr_acc']:.3f}") if two_view else ""
             print(
                 f"[ep{epoch:03d}/{max_epochs:03d}] "
                 f"loss={avg['loss']:.4f}  mlm={avg['loss_mlm']:.4f}  "
-                f"rr={avg['loss_rr']:.4f}  fid={avg['loss_fid']:.5f}  "
-                f"acc={avg['acc']:.3f}  "
+                f"rr={avg['loss_rr']:.4f}  fid={avg['loss_fid']:.5f}{ctr_str}  "
+                f"acc={avg['acc']:.3f}  acc_nt={avg['acc_nontop']:.3f}  "
                 f"epoch_time={_fmt_dur(elapsed)}  "
                 f"elapsed={_fmt_dur(total_elapsed)}  eta={_fmt_dur(eta)}",
                 flush=True,
@@ -423,8 +600,9 @@ def train(cfg: dict, resume: str | None = None):
         # ---------- Eval ----------
         if epoch % int(cfg["training"]["eval_every"]) == 0:
             model.eval(); mlm_head.eval(); rr_head.eval(); fid_head.eval()
+            proj_head.eval()
             local_sums = {"loss": 0.0, "loss_mlm": 0.0, "loss_rr": 0.0,
-                          "loss_fid": 0.0, "acc": 0.0}
+                          "loss_fid": 0.0, "acc": 0.0, "acc_nontop": 0.0}
             local_bs = 0
             with torch.no_grad():
                 for batch in val_loader:
@@ -448,15 +626,21 @@ def train(cfg: dict, resume: str | None = None):
                         hidden_bm = token_out[bm]
                         logits = mlm_head(hidden_bm)
                         tgts   = indices[bm]
-                        l_mlm  = F.cross_entropy(logits, tgts).item()
-                        accv   = (logits.argmax(-1) == tgts).float().mean().item()
+                        l_mlm  = F.cross_entropy(logits, tgts, weight=ce_weight).item()
+                        pred = logits.argmax(-1)
+                        accv = (pred == tgts).float().mean().item()
+                        if top1_token_id is not None:
+                            nt_v = tgts != top1_token_id
+                            accv_nt = (pred[nt_v] == tgts[nt_v]).float().mean().item() if nt_v.any() else 0.0
+                        else:
+                            accv_nt = accv
                         if fid_w > 0:
                             tgt_fid = _normalize_target(fid_feats[bm], fid_mean_t, fid_std_t)
                             l_fid = F.mse_loss(fid_head(hidden_bm), tgt_fid).item()
                         else:
                             l_fid = 0.0
                     else:
-                        l_mlm, accv, l_fid = 0.0, 0.0, 0.0
+                        l_mlm, accv, accv_nt, l_fid = 0.0, 0.0, 0.0, 0.0
 
                     rmask = masked["rhythm_mask"]
                     if rmask.any():
@@ -466,14 +650,15 @@ def train(cfg: dict, resume: str | None = None):
                         l_rr = 0.0
 
                     total_loss = morph_w * l_mlm + rhythm_w * l_rr + fid_w * l_fid
-                    local_sums["loss"]     += total_loss * B
-                    local_sums["loss_mlm"] += l_mlm * B
-                    local_sums["loss_rr"]  += l_rr * B
-                    local_sums["loss_fid"] += l_fid * B
-                    local_sums["acc"]      += accv * B
+                    local_sums["loss"]       += total_loss * B
+                    local_sums["loss_mlm"]   += l_mlm * B
+                    local_sums["loss_rr"]    += l_rr * B
+                    local_sums["loss_fid"]   += l_fid * B
+                    local_sums["acc"]        += accv * B
+                    local_sums["acc_nontop"] += accv_nt * B
                     local_bs += B
 
-            keys = ["loss", "loss_mlm", "loss_rr", "loss_fid", "acc"]
+            keys = ["loss", "loss_mlm", "loss_rr", "loss_fid", "acc", "acc_nontop"]
             stats = torch.tensor(
                 [local_sums[k] for k in keys] + [float(local_bs)],
                 device=device,
@@ -494,7 +679,8 @@ def train(cfg: dict, resume: str | None = None):
                     f"mlm={val_metrics['loss_mlm']:.4f}  "
                     f"rr={val_metrics['loss_rr']:.4f}  "
                     f"fid={val_metrics['loss_fid']:.5f}  "
-                    f"acc={val_metrics['acc']:.3f}{tag}",
+                    f"acc={val_metrics['acc']:.3f}  "
+                    f"acc_nt={val_metrics['acc_nontop']:.3f}{tag}",
                     flush=True,
                 )
 
@@ -506,9 +692,10 @@ def train(cfg: dict, resume: str | None = None):
                         path=os.path.join(ckpt_dir, "best.pt"),
                         model_cfg=model_cfg,
                         extra={
-                            "mlm_head": raw_mlm_head.state_dict(),
-                            "rr_head":  raw_rr_head.state_dict(),
-                            "fid_head": raw_fid_head.state_dict(),
+                            "mlm_head":  raw_mlm_head.state_dict(),
+                            "rr_head":   raw_rr_head.state_dict(),
+                            "fid_head":  raw_fid_head.state_dict(),
+                            "proj_head": raw_proj_head.state_dict(),
                         },
                     )
                 else:
@@ -521,9 +708,10 @@ def train(cfg: dict, resume: str | None = None):
                 path=os.path.join(ckpt_dir, f"epoch_{epoch:03d}.pt"),
                 model_cfg=model_cfg,
                 extra={
-                    "mlm_head": raw_mlm_head.state_dict(),
-                    "rr_head":  raw_rr_head.state_dict(),
-                    "fid_head": raw_fid_head.state_dict(),
+                    "mlm_head":  raw_mlm_head.state_dict(),
+                    "rr_head":   raw_rr_head.state_dict(),
+                    "fid_head":  raw_fid_head.state_dict(),
+                    "proj_head": raw_proj_head.state_dict(),
                 },
             )
 
@@ -536,6 +724,7 @@ def train(cfg: dict, resume: str | None = None):
                     "mlm_head":      raw_mlm_head.state_dict(),
                     "rr_head":       raw_rr_head.state_dict(),
                     "fid_head":      raw_fid_head.state_dict(),
+                    "proj_head":     raw_proj_head.state_dict(),
                     "scheduler":     scheduler.state_dict(),
                     "best_val_loss": best_val_loss,
                     "global_step":   global_step,
