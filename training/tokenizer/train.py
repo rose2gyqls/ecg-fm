@@ -21,8 +21,9 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
+from collections import deque
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from tqdm.auto import tqdm
 
 from torch.utils.tensorboard import SummaryWriter
@@ -221,7 +222,25 @@ def train(cfg: dict, resume: str | None = None):
         lr=float(cfg["training"]["lr"]),
         weight_decay=float(cfg["training"]["weight_decay"]),
     )
-    scheduler = CosineAnnealingLR(opt, T_max=cfg["training"]["max_epochs"])
+    # Real LR warmup. Earlier versions exposed `warmup_epochs` in config but
+    # only constructed CosineAnnealingLR, so the field was a no-op. v4 wires
+    # it through as a linear ramp from 1% lr → 100% lr over `warmup_epochs`,
+    # then cosine-anneals over the remaining epochs. This eliminates the
+    # epoch-1/2 transient where lr=3e-4 hits a freshly k-means-initialized
+    # codebook and produces large early-step gradient noise.
+    max_epochs    = cfg["training"]["max_epochs"]
+    warmup_epochs = int(cfg["training"].get("warmup_epochs", 0) or 0)
+    if warmup_epochs > 0 and warmup_epochs < max_epochs:
+        warmup = LinearLR(
+            opt, start_factor=1e-2, end_factor=1.0,
+            total_iters=warmup_epochs,
+        )
+        cosine = CosineAnnealingLR(opt, T_max=max_epochs - warmup_epochs)
+        scheduler = SequentialLR(
+            opt, schedulers=[warmup, cosine], milestones=[warmup_epochs],
+        )
+    else:
+        scheduler = CosineAnnealingLR(opt, T_max=max_epochs)
 
     loss_cfg = cfg["training"]["loss"]
     ckpt_dir = cfg["training"]["ckpt_dir"]
@@ -243,6 +262,7 @@ def train(cfg: dict, resume: str | None = None):
     alpha          = float(loss_cfg.get("alpha", 1.0))
     beta           = float(loss_cfg.get("beta", 0.5))
     gamma          = float(loss_cfg.get("gamma", 0.0))
+    delta          = float(loss_cfg.get("delta", 0.0))     # entropy bonus
     spec_n_ffts    = tuple(loss_cfg.get("spec_n_ffts", (32, 64, 128)))
 
     # QRS weight map (only used when use_gradient_loss is False).
@@ -274,8 +294,16 @@ def train(cfg: dict, resume: str | None = None):
     es_patience = int(cfg["training"].get("early_stop_patience", 0) or 0)
     es_bad = 0
 
+    # Sliding-window best-checkpoint selection. With high val_loss noise
+    # (CV ~6% on this dataset) a single-eval `min` rewards lucky outliers
+    # rather than a converged plateau — that's why v3's best.pt locked into
+    # epoch 2/4 even though training kept improving the latent. Using the
+    # mean over the last `best_window` evals smooths out per-epoch noise.
+    # 1 disables (legacy behaviour: any single-eval improvement wins).
+    best_window  = int(cfg["training"].get("best_window", 1) or 1)
+    val_history: deque[float] = deque(maxlen=best_window)
+
     best_val_loss = float("inf")
-    max_epochs    = cfg["training"]["max_epochs"]
     start_epoch   = 1
     global_step   = 0
 
@@ -332,8 +360,8 @@ def train(cfg: dict, resume: str | None = None):
         model.train()
         t_epoch = time.time()
         running = {"loss": 0.0, "loss_rec": 0.0, "loss_vq": 0.0,
-                   "loss_fid": 0.0, "loss_spec": 0.0, "perplexity": 0.0,
-                   "n_dead_restarted": 0.0}
+                   "loss_fid": 0.0, "loss_spec": 0.0, "loss_ent": 0.0,
+                   "perplexity": 0.0, "n_dead_restarted": 0.0}
         n_steps = 0
 
         pbar = tqdm(
@@ -347,7 +375,8 @@ def train(cfg: dict, resume: str | None = None):
             x_hat, vq_dict = model(x)
             losses = total_vqvae_loss(
                 x, x_hat, vq_dict["loss_vq"],
-                alpha=alpha, beta=beta, gamma=gamma,
+                alpha=alpha, beta=beta, gamma=gamma, delta=delta,
+                neg_entropy=vq_dict.get("neg_entropy"),
                 use_gradient_loss=use_grad_loss,
                 fiducial_weights=fid_weights,
                 spec_n_ffts=spec_n_ffts,
@@ -377,6 +406,7 @@ def train(cfg: dict, resume: str | None = None):
                     "loss_vq":    losses["loss_vq"].item(),
                     "loss_fid":   losses["loss_fid"].item(),
                     "loss_spec":  losses["loss_spec"].item(),
+                    "loss_ent":   losses["loss_ent"].item(),
                     "perplexity": vq_dict["perplexity"].item(),
                     "n_dead_restarted": float(n_dead_restarted),
                 }
@@ -409,7 +439,7 @@ def train(cfg: dict, resume: str | None = None):
                 f"[ep{epoch:03d}/{max_epochs:03d}] "
                 f"loss={avg['loss']:.4f}  rec={avg['loss_rec']:.4f}  "
                 f"vq={avg['loss_vq']:.4f}  fid={avg['loss_fid']:.4f}  "
-                f"spec={avg['loss_spec']:.4f}  "
+                f"spec={avg['loss_spec']:.4f}  ent={avg['loss_ent']:.4f}  "
                 f"ppl={avg['perplexity']:.2f}  "
                 f"dead_restart_avg={avg['n_dead_restarted']:.2f}  "
                 f"epoch_time={_fmt_dur(elapsed)}  "
@@ -423,7 +453,8 @@ def train(cfg: dict, resume: str | None = None):
         if do_eval:
             model.eval()
             local_sums = {"loss": 0.0, "loss_rec": 0.0, "loss_vq": 0.0,
-                          "loss_fid": 0.0, "loss_spec": 0.0, "perplexity": 0.0}
+                          "loss_fid": 0.0, "loss_spec": 0.0, "loss_ent": 0.0,
+                          "perplexity": 0.0}
             local_cnt = 0
             with torch.no_grad():
                 for batch in val_loader:
@@ -434,6 +465,8 @@ def train(cfg: dict, resume: str | None = None):
                         alpha=alpha,
                         beta=beta,
                         gamma=gamma,
+                        delta=delta,
+                        neg_entropy=vq_dict.get("neg_entropy"),
                         use_gradient_loss=use_grad_loss,
                         fiducial_weights=fid_weights,
                         spec_n_ffts=spec_n_ffts,
@@ -444,10 +477,12 @@ def train(cfg: dict, resume: str | None = None):
                     local_sums["loss_vq"]   += losses["loss_vq"].item() * bs
                     local_sums["loss_fid"]  += losses["loss_fid"].item() * bs
                     local_sums["loss_spec"] += losses["loss_spec"].item() * bs
+                    local_sums["loss_ent"]  += losses["loss_ent"].item() * bs
                     local_sums["perplexity"] += vq_dict["perplexity"].item() * bs
                     local_cnt += bs
 
-            keys = ["loss", "loss_rec", "loss_vq", "loss_fid", "loss_spec", "perplexity"]
+            keys = ["loss", "loss_rec", "loss_vq", "loss_fid",
+                    "loss_spec", "loss_ent", "perplexity"]
             stats = torch.tensor(
                 [local_sums[k] for k in keys] + [float(local_cnt)],
                 device=device,
@@ -457,27 +492,36 @@ def train(cfg: dict, resume: str | None = None):
             cnt = stats[-1].clamp(min=1)
             val_metrics = {k: (stats[i] / cnt).item() for i, k in enumerate(keys)}
             val_loss = val_metrics["loss"]
-            val_loss_for_es = val_loss
+
+            # Smoothed val_loss for both best.pt selection and early stop.
+            # Falls back to raw val_loss if best_window <= 1.
+            val_history.append(val_loss)
+            val_loss_smoothed = sum(val_history) / len(val_history)
+            val_loss_for_es = val_loss_smoothed
 
             if is_main:
                 logger.update(split="val", epoch=epoch, **val_metrics)
                 for k, v in val_metrics.items():
                     tb.add_scalar(f"val/{k}", v, epoch)
-                tag = " ★best" if val_loss < best_val_loss else ""
+                tb.add_scalar("val/loss_smoothed", val_loss_smoothed, epoch)
+                improved = val_loss_smoothed < best_val_loss
+                tag = " ★best" if improved else ""
                 print(
                     f"          val  loss={val_loss:.4f}  "
+                    f"smooth={val_loss_smoothed:.4f}  "
                     f"rec={val_metrics['loss_rec']:.4f}  "
                     f"vq={val_metrics['loss_vq']:.4f}  "
                     f"fid={val_metrics['loss_fid']:.4f}  "
                     f"spec={val_metrics['loss_spec']:.4f}  "
+                    f"ent={val_metrics['loss_ent']:.4f}  "
                     f"ppl={val_metrics['perplexity']:.1f}{tag}",
                     flush=True,
                 )
 
-                if val_loss < best_val_loss:
-                    best_val_loss = val_loss
+                if improved:
+                    best_val_loss = val_loss_smoothed
                     es_bad = 0
-                    save_checkpoint(raw_model, opt, epoch, val_loss,
+                    save_checkpoint(raw_model, opt, epoch, val_loss_smoothed,
                                     path=os.path.join(ckpt_dir, "best.pt"),
                                     model_cfg=cfg["model"])
                 else:

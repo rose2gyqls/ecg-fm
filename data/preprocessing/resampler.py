@@ -60,22 +60,54 @@ def normalize_beat(beat: np.ndarray, method: str = "zscore") -> np.ndarray:
 # QRS amplitude ~1 mV ends up at ~`1 mV / (scale · p75)` ≈ a few units.
 
 def compute_record_norm_stats(
-    signal: np.ndarray, eps: float = 1e-6, percentile: float = 75.0
+    signal: np.ndarray,
+    eps: float = 1e-6,
+    percentile: float = 75.0,
+    min_scale: float = 0.05,
 ) -> tuple[float, float]:
-    """Global median and percentile-based robust scale over (lead, time)."""
+    """Robust median and per-lead-aggregated scale over (12, T).
+
+    The scale is **median over per-lead p75(|sig − median|)** so that one
+    extreme lead (either flat or unusually loud) cannot dominate the global
+    p75 and pull the record's scale to a pathological value. This was the
+    failure mode in v3: records with several near-isoelectric leads dragged
+    the global p75 below `min_scale`, so the surviving lead's QRS got
+    amplified by ~20× and produced batch-level loss spikes.
+
+    `min_scale` (mV) floors the result. 0.05 mV ≈ 5× typical noise floor —
+    high enough that a fully-degenerate record gets clamped instead of
+    amplified, low enough that any diagnostic content passes through.
+    """
     median = float(np.median(signal))
-    scale = float(np.percentile(np.abs(signal - median), percentile)) + eps
+    if signal.ndim >= 2:
+        # signal: (L, T) — per-lead p75, then median across leads.
+        per_lead = np.percentile(np.abs(signal - median), percentile, axis=-1)
+        scale = float(np.median(per_lead)) + eps
+    else:
+        scale = float(np.percentile(np.abs(signal - median), percentile)) + eps
+    scale = max(scale, min_scale)
     return median, scale
 
 
 def apply_record_norm(
-    x: np.ndarray, median: float, robust_scale: float, scale: float = 5.0
+    x: np.ndarray,
+    median: float,
+    robust_scale: float,
+    scale: float = 5.0,
+    clip: float | None = None,
 ) -> np.ndarray:
     """Apply record-level (median, robust_scale)·scale normalization.
 
-    `robust_scale` is the value returned by `compute_record_norm_stats`
-    (75th percentile of |sig − median| by default). `scale` is an additional
-    multiplier so that the normalized output sits in roughly ±1 for typical
-    diagnostic content.
+    `robust_scale` is the value returned by `compute_record_norm_stats`.
+    `scale` is an additional multiplier so that normalized output sits in
+    roughly ±1 for typical diagnostic content.
+
+    `clip` (optional, in normalized units): hard-cap normalized magnitude.
+    Belt-and-suspenders against any residual outliers that the stats fix
+    above didn't catch — caps |x| at `clip` so a single rogue beat cannot
+    spike the loss. None disables.
     """
-    return ((x - median) / (scale * robust_scale)).astype(np.float32)
+    out = ((x - median) / (scale * robust_scale)).astype(np.float32)
+    if clip is not None:
+        np.clip(out, -float(clip), float(clip), out=out)
+    return out

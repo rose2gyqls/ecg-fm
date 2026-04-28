@@ -42,16 +42,17 @@ class VQVAE(nn.Module):
         x : (B, 1, W)
         Returns:
             x_hat    : (B, 1, W)
-            loss_dict: {"loss_vq": ..., "perplexity": ..., "indices": ...}
+            loss_dict: {"loss_vq", "perplexity", "neg_entropy", "indices"}
         """
         z_e               = self.encoder(x)
-        z_q, idx, l_vq, ppl = self.codebook(z_e)
+        z_q, idx, l_vq, ppl, neg_h = self.codebook(z_e)
         x_hat             = self.decoder(z_q)
 
         return x_hat, {
-            "loss_vq":    l_vq,
-            "perplexity": ppl,
-            "indices":    idx,
+            "loss_vq":     l_vq,
+            "perplexity":  ppl,
+            "neg_entropy": neg_h,
+            "indices":     idx,
         }
 
     # ── inference only ───────────────────────────────────────────────────────
@@ -61,7 +62,7 @@ class VQVAE(nn.Module):
         """beat -> (z_q, indices)  — Phase 3 pretrain 입력 생성용"""
         self.eval()
         z_e = self.encoder(x)
-        z_q, idx, _, _ = self.codebook(z_e)
+        z_q, idx, *_ = self.codebook(z_e)
         return z_q, idx
 
     @torch.no_grad()

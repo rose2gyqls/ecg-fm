@@ -1,7 +1,7 @@
 """
 VQ-VAE training losses.
 
-L_total = L_rec + alpha * L_vq + beta * L_fid + gamma * L_spec
+L_total = L_rec + α·L_vq + β·L_fid + γ·L_spec + δ·L_ent
 
   L_rec  : MSE in time domain.
   L_vq   : commitment (EMA mode) or commitment + codebook (non-EMA mode);
@@ -11,6 +11,11 @@ L_total = L_rec + alpha * L_vq + beta * L_fid + gamma * L_spec
            around the R position.
   L_spec : multi-scale STFT magnitude L1, complementing the time-domain
            MSE so morphology stays sharp instead of being smoothed out.
+  L_ent  : codebook usage entropy regularizer = −H(usage) so that
+           minimizing total loss pushes usage toward uniform. This
+           specifically prevents the "V1–V6 collapse onto one code"
+           failure mode, where a low-perplexity codebook merges all
+           precordial leads into the same index.
 """
 
 from __future__ import annotations
@@ -133,12 +138,15 @@ def total_vqvae_loss(
     alpha: float = 1.0,
     beta: float = 0.5,
     gamma: float = 0.0,
+    delta: float = 0.0,
+    neg_entropy: Optional[torch.Tensor] = None,
     use_gradient_loss: bool = True,
     fiducial_weights: Optional[torch.Tensor] = None,
     spec_n_ffts: Iterable[int] = (32, 64, 128),
 ) -> dict:
     """
-    Combine the four reconstruction-side terms with the codebook commitment.
+    Combine the four reconstruction-side terms with the codebook commitment
+    and (optionally) a usage-entropy regularizer.
 
     Fiducial behavior:
         use_gradient_loss=True             -> L_fid = gradient_loss(x, x_hat)
@@ -146,6 +154,7 @@ def total_vqvae_loss(
         use_gradient_loss=False, weights=None -> L_fid disabled (zero)
 
     gamma=0 short-circuits the spectral loss entirely.
+    delta=0 short-circuits the entropy regularizer.
     """
     l_rec = reconstruction_loss(x, x_hat)
 
@@ -161,7 +170,22 @@ def total_vqvae_loss(
         if gamma > 0 else x.new_zeros(())
     )
 
-    total = l_rec + alpha * loss_vq + beta * l_fid + gamma * l_spec
+    # L_ent = neg_entropy = sum p log p (≤ 0). Adding δ·L_ent to total means
+    # gradient pushes p toward uniform, raising perplexity and breaking the
+    # V1–V6 collapse pattern. We only consume it when delta>0 and the
+    # codebook actually returned a tensor.
+    if delta > 0 and neg_entropy is not None:
+        l_ent = neg_entropy
+    else:
+        l_ent = x.new_zeros(())
+
+    total = (
+        l_rec
+        + alpha * loss_vq
+        + beta * l_fid
+        + gamma * l_spec
+        + delta * l_ent
+    )
 
     return {
         "loss":      total,
@@ -169,4 +193,5 @@ def total_vqvae_loss(
         "loss_vq":   loss_vq,
         "loss_fid":  l_fid,
         "loss_spec": l_spec,
+        "loss_ent":  l_ent,
     }

@@ -1,0 +1,94 @@
+# ── VQ-VAE Beat Tokenizer v4 — 전체 HEEDB + codebook=256 ────────────────────
+# v4 변경사항은 vqvae_heedb_full_cb512_v4.yaml 헤더 참조.
+
+data:
+  source: heedb
+  train_list: /home/irteam/local-node-d/hbkimi/ecg-fm/file_lists/train_files_full.txt
+  val_list:   /home/irteam/local-node-d/hbkimi/ecg-fm/file_lists/val_files_full.txt
+  target_fs: 500
+  beat_length: 256
+  before_ms: 200
+  after_ms: 400
+  normalize: record_mad
+  record_mad_scale: 5.0
+  record_mad_min_scale: 0.05
+  record_mad_clip: 8.0
+  max_beats_per_record: 10
+  record_cache_size: 8000              # ★ v4: 2000 → 8000 — 2TB RAM 활용해 R-peak cache hit ↑
+  cache: false
+  n_leads: 12
+  seed: 42
+
+  virtual_len:
+    train: 50_000_000
+    val:    1_200_000
+
+  rpeak_validation:
+    local_max:         true
+    local_max_window:  10
+    local_max_shift:   8
+
+  noise_filter:
+    enabled: true
+    ptp_min: 0.1
+    std_min: 0.01
+
+model:
+  encoder:
+    in_channels: 1
+    channels: [32, 64, 128, 256]
+    kernel_sizes: [7, 5, 3, 3]
+    strides:   [2, 2, 2, 2]
+    dropout: 0.1
+    l2_normalize: true
+  decoder:
+    latent_dim: 256
+    channels: [256, 128, 64, 32]
+    kernel_sizes: [3, 3, 5, 7]
+  codebook:
+    num_embeddings: 256
+    embedding_dim: 256
+    commitment_cost: 0.25                # ★ v4: 0.1 → 0.25 — encoder commit ↑
+    ema_decay: 0.97                      # ★ v4: 0.99 → 0.97 — codebook EMA tracking ↑
+    ema_update: true
+    cosine: true
+  latent_dim: 256
+
+training:
+  batch_size: 1024
+  lr: 3e-4
+  weight_decay: 1e-4
+  max_epochs: 100
+  warmup_epochs: 5
+  grad_clip: 1.0
+  num_workers: 18
+  prefetch_factor: 8
+
+  kmeans_init:
+    enabled: true
+    n_samples: 50_000
+    n_iter: 10
+
+  early_stop_patience: 20
+  best_window: 5
+
+  loss:
+    alpha: 1.0
+    beta: 2.0
+    gamma: 0.15
+    delta: 0.05
+    use_gradient_loss: true
+    fiducial_weight_map: false
+    spec_n_ffts: [32, 64, 128]
+
+    restart_dead_every: 2000
+    restart_dead_threshold: 0.1
+
+  log_dir:  logs/tokenizer_heedb_full_cb256_v4
+  tb_dir:   logs/tb/tokenizer/cb256_v4
+  ckpt_dir: checkpoints/tokenizer_heedb_full_cb256_v4
+  save_every: 10
+  eval_every: 2
+  monitor:
+    codebook_usage: true
+    perplexity: true

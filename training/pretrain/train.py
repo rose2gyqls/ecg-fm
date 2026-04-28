@@ -32,7 +32,7 @@ from models.tokenizer.vqvae import VQVAE
 from models.transformer.ecg_model import ECGFoundationModel
 from models.heads.mlm_head import MaskedBeatModelingHead, MaskedRhythmHead, MaskedFiducialHead
 from models.heads.contrastive_head import ProjectionHead, nt_xent_loss
-from training.pretrain.masking import apply_masking, lead_dropout_schedule
+from training.pretrain.masking import apply_masking, lead_dropout_schedule, mask_ratio_schedule
 from utils.checkpointing import save_checkpoint
 from utils.logging_utils import MetricLogger
 
@@ -268,25 +268,56 @@ def train(cfg: dict, resume: str | None = None):
     def _normalize_target(t, mean, std):
         return t if mean is None or std is None else (t - mean) / (std + 1e-8)
 
-    # Masking strategy and lead-dropout curriculum.
+    # Masking strategy and curricula. beat_mask_ratio / rhythm_mask_ratio can
+    # be ramped up over the first `mask_warmup_epochs` from `mask_start_ratio`
+    # to their max — gives the model an easier task early so it can establish
+    # a useful representation before the harder MAE-style mask kicks in.
     mask_strategy = str(mask_cfg.get("mask_strategy", "span"))
     span_length   = int(mask_cfg.get("span_length", 3))
+
+    beat_mask_max     = float(mask_cfg.get("beat_mask_ratio", 0.5))
+    rhythm_mask_max   = float(mask_cfg.get("rhythm_mask_ratio", 0.5))
+    mask_warmup_ep    = int(mask_cfg.get("mask_warmup_epochs", 0))
+    mask_warmup_sched = str(mask_cfg.get("mask_warmup_schedule", "linear"))
+    mask_start_ratio  = float(mask_cfg.get("mask_start_ratio", 0.15))
+
     ld_max_prob   = float(mask_cfg.get("lead_dropout_prob", 0.0))
     ld_schedule   = str(mask_cfg.get("lead_dropout_schedule", "constant"))
     ld_warmup     = int(mask_cfg.get("lead_dropout_warmup_epochs", 0))
     if is_main:
         print(f"[Pretrain] mask_strategy={mask_strategy} span={span_length} "
-              f"beat_ratio={mask_cfg.get('beat_mask_ratio')} "
-              f"rhythm_ratio={mask_cfg.get('rhythm_mask_ratio')} "
-              f"lead_dropout: {ld_schedule} -> {ld_max_prob} (warmup={ld_warmup}ep)")
+              f"beat_ratio: {mask_warmup_sched} {mask_start_ratio}->{beat_mask_max} "
+              f"(warmup={mask_warmup_ep}ep) "
+              f"rhythm_ratio_max={rhythm_mask_max} "
+              f"lead_dropout: {ld_schedule} {ld_max_prob} (warmup={ld_warmup}ep)")
 
-    # Early stopping (0 disables).
+    # Early stopping (0 disables). The metric is configurable:
+    #   "val_loss"        — lower is better (legacy default)
+    #   "val_acc_nontop"  — higher is better. Tracks MLM accuracy on tokens
+    #                       OTHER than the dominant codebook token. Catches
+    #                       the v2 failure mode where val_loss falls while
+    #                       the model collapses to predicting the top-1 code.
     es_patience = int(cfg["training"].get("early_stop_patience", 0) or 0)
+    es_metric   = str(cfg["training"].get("early_stop_metric", "val_loss"))
+    if es_metric not in ("val_loss", "val_acc_nontop"):
+        raise ValueError(f"unknown early_stop_metric: {es_metric}")
+    es_higher_better = (es_metric == "val_acc_nontop")
     es_bad = 0
+    if is_main:
+        print(f"[Pretrain] early-stop metric={es_metric} "
+              f"({'higher' if es_higher_better else 'lower'} is better) "
+              f"patience={es_patience}")
 
+    # Tracking variables. Keep `best_val_loss` for backward compat (saved on
+    # last.pt and used by callers that grep our checkpoint structure), but
+    # gate save/early-stop on the chosen metric `best_metric`.
     best_val_loss = float("inf")
+    best_metric   = float("-inf") if es_higher_better else float("inf")
     start_epoch   = 1
     global_step   = 0
+
+    def _is_better(new: float, ref: float) -> bool:
+        return (new > ref) if es_higher_better else (new < ref)
 
     # ---------- Resume ----------
     if resume is None:
@@ -310,10 +341,17 @@ def train(cfg: dict, resume: str | None = None):
             scheduler.load_state_dict(ck["scheduler"])
         start_epoch   = int(ck.get("epoch", 0)) + 1
         best_val_loss = float(ck.get("best_val_loss", ck.get("metric") or float("inf")))
+        # Restore best_metric if previously saved under same metric, else fall
+        # back to (best_val_loss for val_loss / -inf for higher-is-better).
+        if "best_metric" in ck and ck.get("best_metric_name") == es_metric:
+            best_metric = float(ck["best_metric"])
+        elif es_metric == "val_loss":
+            best_metric = best_val_loss
         global_step   = int(ck.get("global_step", 0))
         if is_main:
             print(f"[Resume] Loaded {resume}  -> start_epoch={start_epoch}  "
-                  f"best_val_loss={best_val_loss:.4f}", flush=True)
+                  f"best_val_loss={best_val_loss:.4f}  "
+                  f"best_{es_metric}={best_metric:.4f}", flush=True)
 
     # ---------- Class-balanced CE weights (Phase E) ----------
     # Tokenizer codebooks are heavily skewed (top-1 code can hold 60%+ of all
@@ -376,11 +414,12 @@ def train(cfg: dict, resume: str | None = None):
 
     t_global = time.time()
 
-    def _apply_mask(indices, rr_feats, current_lead_dropout: float):
+    def _apply_mask(indices, rr_feats, current_lead_dropout: float,
+                    current_beat_ratio: float, current_rhythm_ratio: float):
         return apply_masking(
             indices, rr_feats,
-            beat_mask_ratio=float(mask_cfg["beat_mask_ratio"]),
-            rhythm_mask_ratio=float(mask_cfg["rhythm_mask_ratio"]),
+            beat_mask_ratio=current_beat_ratio,
+            rhythm_mask_ratio=current_rhythm_ratio,
             span_length=span_length,
             lead_dropout_prob=current_lead_dropout,
             lead_min_leads=int(mask_cfg.get("lead_dropout_min_leads", 1)),
@@ -458,15 +497,28 @@ def train(cfg: dict, resume: str | None = None):
         if ddp and train_sampler is not None:
             train_sampler.set_epoch(epoch)
 
-        # Lead-dropout curriculum: ramps from 0 to ld_max_prob over ld_warmup epochs.
+        # Curricula for this epoch. Lead dropout ramps 0 → ld_max over ld_warmup.
+        # Beat / rhythm mask ratios ramp mask_start → max over mask_warmup_ep.
         cur_lead_dropout = lead_dropout_schedule(
             epoch=epoch,
             max_prob=ld_max_prob,
             schedule=ld_schedule,
             warmup_epochs=ld_warmup,
         )
+        cur_beat_ratio = mask_ratio_schedule(
+            epoch=epoch, max_ratio=beat_mask_max,
+            schedule=mask_warmup_sched, warmup_epochs=mask_warmup_ep,
+            start_ratio=mask_start_ratio,
+        )
+        cur_rhythm_ratio = mask_ratio_schedule(
+            epoch=epoch, max_ratio=rhythm_mask_max,
+            schedule=mask_warmup_sched, warmup_epochs=mask_warmup_ep,
+            start_ratio=mask_start_ratio,
+        )
         if is_main:
-            print(f"[Pretrain] epoch {epoch}: lead_dropout_prob={cur_lead_dropout:.3f}", flush=True)
+            print(f"[Pretrain] epoch {epoch}: "
+                  f"beat_mask={cur_beat_ratio:.3f}  rhythm_mask={cur_rhythm_ratio:.3f}  "
+                  f"lead_dropout={cur_lead_dropout:.3f}", flush=True)
 
         # ---------- Train ----------
         model.train(); mlm_head.train(); rr_head.train(); fid_head.train()
@@ -503,12 +555,14 @@ def train(cfg: dict, resume: str | None = None):
             indices = idx_flat.view(B, N, L)
 
             # ── View 1 (always) ────────────────────────────────────────────
-            masked1 = _apply_mask(indices, rr_feats, cur_lead_dropout)
+            masked1 = _apply_mask(indices, rr_feats, cur_lead_dropout,
+                                  cur_beat_ratio, cur_rhythm_ratio)
             v1 = _compute_view(masked1, indices, rr_feats, fid_feats, stft, B, N, L)
 
             if two_view:
                 # ── View 2: independent masking on the same record ─────────
-                masked2 = _apply_mask(indices, rr_feats, cur_lead_dropout)
+                masked2 = _apply_mask(indices, rr_feats, cur_lead_dropout,
+                                      cur_beat_ratio, cur_rhythm_ratio)
                 v2 = _compute_view(masked2, indices, rr_feats, fid_feats, stft, B, N, L)
 
                 loss_mlm = 0.5 * (v1["loss_mlm"] + v2["loss_mlm"])
@@ -562,6 +616,9 @@ def train(cfg: dict, resume: str | None = None):
                 for k, v in vals.items():
                     tb.add_scalar(f"train/{k}", v, global_step)
                 tb.add_scalar("train/ctr_weight", cur_ctr_w, global_step)
+                tb.add_scalar("train/beat_mask_ratio", cur_beat_ratio, global_step)
+                tb.add_scalar("train/rhythm_mask_ratio", cur_rhythm_ratio, global_step)
+                tb.add_scalar("train/lead_dropout_prob", cur_lead_dropout, global_step)
                 if n_steps % 20 == 0:
                     pbar.set_postfix({
                         "loss": f"{running['loss']/n_steps:.3f}",
@@ -616,7 +673,8 @@ def train(cfg: dict, resume: str | None = None):
                     B, N, L, W = beats.shape
                     _, idx_flat = tokenizer.encode(beats.view(B * N * L, 1, W))
                     indices = idx_flat.view(B, N, L)
-                    masked = _apply_mask(indices, rr_feats, cur_lead_dropout)
+                    masked = _apply_mask(indices, rr_feats, cur_lead_dropout,
+                                         cur_beat_ratio, cur_rhythm_ratio)
                     stft_in = stft * (~masked["lead_mask"]).to(stft.dtype).view(B, L, 1, 1)
                     out = model(masked["masked_indices"], masked["masked_rr_feats"], stft_in)
                     token_out = out[:, 1:, :].view(B, N, L, -1)
@@ -669,33 +727,48 @@ def train(cfg: dict, resume: str | None = None):
             val_metrics = {k: (stats[i] / cnt).item() for i, k in enumerate(keys)}
             val_loss = val_metrics["loss"]
 
+            # The metric we early-stop on (and use to pick "best.pt").
+            cur_metric = (val_metrics["acc_nontop"]
+                          if es_metric == "val_acc_nontop"
+                          else val_loss)
+            improved = _is_better(cur_metric, best_metric)
+
             if is_main:
                 logger.update(split="val", epoch=epoch, **val_metrics)
                 for k, v in val_metrics.items():
                     tb.add_scalar(f"val/{k}", v, epoch)
-                tag = " *best" if val_loss < best_val_loss else ""
+                tag = " *best" if improved else ""
                 print(
                     f"          val  loss={val_loss:.4f}  "
                     f"mlm={val_metrics['loss_mlm']:.4f}  "
                     f"rr={val_metrics['loss_rr']:.4f}  "
                     f"fid={val_metrics['loss_fid']:.5f}  "
                     f"acc={val_metrics['acc']:.3f}  "
-                    f"acc_nt={val_metrics['acc_nontop']:.3f}{tag}",
+                    f"acc_nt={val_metrics['acc_nontop']:.3f}  "
+                    f"[best by {es_metric}={cur_metric:.4f}]{tag}",
                     flush=True,
                 )
 
+                # Track val_loss continuously (used as a fallback metric on
+                # checkpoints), but base save/early-stop on `best_metric`.
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
+
+                if improved:
+                    best_metric = cur_metric
                     es_bad = 0
                     save_checkpoint(
-                        raw_model, opt, epoch, val_loss,
+                        raw_model, opt, epoch, cur_metric,
                         path=os.path.join(ckpt_dir, "best.pt"),
                         model_cfg=model_cfg,
                         extra={
-                            "mlm_head":  raw_mlm_head.state_dict(),
-                            "rr_head":   raw_rr_head.state_dict(),
-                            "fid_head":  raw_fid_head.state_dict(),
-                            "proj_head": raw_proj_head.state_dict(),
+                            "mlm_head":         raw_mlm_head.state_dict(),
+                            "rr_head":          raw_rr_head.state_dict(),
+                            "fid_head":         raw_fid_head.state_dict(),
+                            "proj_head":        raw_proj_head.state_dict(),
+                            "best_metric_name": es_metric,
+                            "best_metric":      best_metric,
+                            "best_val_loss":    best_val_loss,
                         },
                     )
                 else:
@@ -721,13 +794,15 @@ def train(cfg: dict, resume: str | None = None):
                 path=os.path.join(ckpt_dir, "last.pt"),
                 model_cfg=model_cfg,
                 extra={
-                    "mlm_head":      raw_mlm_head.state_dict(),
-                    "rr_head":       raw_rr_head.state_dict(),
-                    "fid_head":      raw_fid_head.state_dict(),
-                    "proj_head":     raw_proj_head.state_dict(),
-                    "scheduler":     scheduler.state_dict(),
-                    "best_val_loss": best_val_loss,
-                    "global_step":   global_step,
+                    "mlm_head":         raw_mlm_head.state_dict(),
+                    "rr_head":          raw_rr_head.state_dict(),
+                    "fid_head":         raw_fid_head.state_dict(),
+                    "proj_head":        raw_proj_head.state_dict(),
+                    "scheduler":        scheduler.state_dict(),
+                    "best_val_loss":    best_val_loss,
+                    "best_metric":      best_metric,
+                    "best_metric_name": es_metric,
+                    "global_step":      global_step,
                 },
             )
 
@@ -750,7 +825,8 @@ def train(cfg: dict, resume: str | None = None):
                 break
 
     if is_main:
-        print(f"[Pretrain] Training complete. Best val_loss={best_val_loss:.4f}")
+        print(f"[Pretrain] Training complete. "
+              f"Best {es_metric}={best_metric:.4f}  best_val_loss={best_val_loss:.4f}")
         if tb is not None:
             tb.close()
     cleanup_ddp()

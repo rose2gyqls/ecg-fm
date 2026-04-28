@@ -77,10 +77,14 @@ class VQCodebook(nn.Module):
             z_e: (B, D) continuous encoder output.
 
         Returns:
-            z_q_st:    (B, D) quantized output with straight-through gradient.
-            indices:   (B,)
-            loss_vq:   scalar VQ loss.
-            perplexity: scalar diagnostic.
+            z_q_st:      (B, D) quantized output with straight-through grad.
+            indices:     (B,)
+            loss_vq:     scalar commitment / codebook loss.
+            perplexity:  scalar diagnostic, exp(H(usage)).
+            neg_entropy: -H(usage), differentiable through batch counts only
+                         when ema_update=False; here it's a detached usage
+                         statistic suitable as a coefficient in an entropy
+                         regularizer applied to z_e (see total_vqvae_loss).
         """
         # Distance is computed in the matching space (unit sphere if cosine).
         z_e_m = self._maybe_normalize(z_e)
@@ -116,12 +120,34 @@ class VQCodebook(nn.Module):
         # gradients through z_e_m (and into z_e via the normalize Jacobian).
         z_q_st = z_e_m + (z_q - z_e_m).detach()
 
-        # Perplexity = exp(entropy of usage distribution). Higher = more uniform.
+        # Soft assignments p(k|z) — differentiable through z_e and the
+        # codebook. Using a temperature τ keeps the softmax sharp enough that
+        # p reflects the hard assignment but smooth enough that the entropy
+        # term has gradient signal. With cosine VQ both vectors are unit-norm
+        # so the natural similarity scale is the cosine in [-1, 1].
+        sims = z_e_m @ cb_m.t()                              # (B, K)
+        if self.cosine:
+            tau = 0.07                                       # CLIP-like temp
+            soft_logits = sims / tau
+        else:
+            # Plain VQ: similarity = -dist/2; tau scales with sqrt(D).
+            tau = (self.D ** 0.5)
+            soft_logits = sims / tau
+        soft_probs = F.softmax(soft_logits, dim=-1)          # (B, K)
+
+        # Batch-level usage distribution.
+        avg_soft = soft_probs.mean(0)                        # (K,)
+        # Negative entropy of usage = sum p log p (≤ 0 with min at uniform).
+        # Used as a regularizer: minimizing this pushes usage toward uniform
+        # and prevents collapse onto a few codes (the V1-V6-merge pattern).
+        neg_entropy = (avg_soft * (avg_soft + 1e-10).log()).sum()
+
+        # Hard-usage perplexity diagnostic (unchanged semantics).
         encodings = F.one_hot(indices, self.K).float()
         avg_probs = encodings.mean(0)
         perplexity = (-(avg_probs * (avg_probs + 1e-10).log()).sum()).exp()
 
-        return z_q_st, indices, loss_vq, perplexity
+        return z_q_st, indices, loss_vq, perplexity, neg_entropy
 
     # ---------------------------------------------------------------------
     # EMA update

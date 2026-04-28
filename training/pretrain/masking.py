@@ -204,6 +204,37 @@ def lead_dropout_schedule(
     raise ValueError(f"unknown lead_dropout schedule: {schedule}")
 
 
+def mask_ratio_schedule(
+    epoch: int,
+    max_ratio: float,
+    schedule: str = "linear",
+    warmup_epochs: int = 0,
+    start_ratio: float = 0.15,
+) -> float:
+    """Per-epoch beat / rhythm mask ratio with optional warmup.
+
+    Same shape as `lead_dropout_schedule` but goes start_ratio → max_ratio
+    over `warmup_epochs`. Set `warmup_epochs=0` (or schedule="constant") to
+    disable the schedule and always emit `max_ratio` (legacy behavior).
+
+      schedule="constant": always max_ratio.
+      schedule="linear":   start_ratio at epoch 1 → max_ratio at epoch warmup+1.
+      schedule="cosine":   start_ratio → max_ratio via half-cosine.
+    """
+    if schedule == "constant" or warmup_epochs <= 0:
+        return float(max_ratio)
+    t = max(0, epoch - 1)
+    if t >= warmup_epochs:
+        return float(max_ratio)
+    frac = t / max(warmup_epochs, 1)
+    delta = float(max_ratio) - float(start_ratio)
+    if schedule == "linear":
+        return float(start_ratio) + delta * frac
+    if schedule == "cosine":
+        return float(start_ratio) + delta * (1 - 0.5 * (1 + math.cos(math.pi * frac)))
+    raise ValueError(f"unknown mask_ratio schedule: {schedule}")
+
+
 # -----------------------------------------------------------------------------
 # Combined masking
 # -----------------------------------------------------------------------------

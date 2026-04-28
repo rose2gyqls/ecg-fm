@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 import glob
 import random
+from collections import OrderedDict
 from typing import List, Tuple, Optional
 
 import numpy as np
@@ -57,6 +58,15 @@ class HEEDBBeatDataset(Dataset):
         self.after_ms    = int(cfg.get("after_ms", 400))
         self.normalize   = cfg.get("normalize", "record_mad")
         self.record_mad_scale = float(cfg.get("record_mad_scale", 5.0))
+        # min_scale floor (mV) for compute_record_norm_stats. v3 default 0.01
+        # let near-isoelectric records amplify residual signal by ~20×, which
+        # produced batch-level loss spikes. v4 raises the floor to 0.05.
+        self.record_mad_min_scale = float(cfg.get("record_mad_min_scale", 0.05))
+        # Post-norm hard cap on |x| in normalized units. None disables.
+        rm_clip = cfg.get("record_mad_clip", None)
+        self.record_mad_clip: Optional[float] = (
+            None if rm_clip is None else float(rm_clip)
+        )
         if self.normalize not in ("record_mad", "zscore", "none"):
             raise ValueError(f"unknown normalize mode: {self.normalize}")
         self.max_per_rec = int(cfg.get("max_beats_per_record", 10))
@@ -85,9 +95,20 @@ class HEEDBBeatDataset(Dataset):
         self._buf: Optional[np.ndarray] = None
         self._buf_idx: int = 0
 
+        # Worker-local LRU cache: file_path → fully processed (M, beat_length)
+        # beats array. On hit, skips neurokit R-peak detect + resample + normalize.
+        # Hit rate starts low (random sampling over 11M files) but hot records
+        # accumulate over epochs. Memory: ~120 beats × 256 f32 × 4B ≈ 120 KB
+        # per record → 2000 entries ≈ 240 MB per worker.
+        self._record_cache: "OrderedDict[str, np.ndarray]" = OrderedDict()
+        self._cache_cap = int(cfg.get("record_cache_size", 2000))
+        self._cache_hits = 0
+        self._cache_misses = 0
+
         self.files = _resolve_files(cfg, split)
         assert self.files, f"No HEEDB files for split={split}"
-        print(f"[HEEDBBeatDataset:{split}] {len(self.files):,} records")
+        print(f"[HEEDBBeatDataset:{split}] {len(self.files):,} records  "
+              f"record_cache_cap={self._cache_cap}")
 
         self._cache: Optional[np.ndarray] = None
         if self.cache_mode:
@@ -170,8 +191,14 @@ class HEEDBBeatDataset(Dataset):
         #    record-level (median, MAD) computed on the full (12, T) raw signal.
         #    Per-beat z-score happens later in __getitem__ for mode=="zscore".
         if self.normalize == "record_mad":
-            med, mad = compute_record_norm_stats(signal)
-            beats = apply_record_norm(beats, med, mad, scale=self.record_mad_scale)
+            med, mad = compute_record_norm_stats(
+                signal, min_scale=self.record_mad_min_scale,
+            )
+            beats = apply_record_norm(
+                beats, med, mad,
+                scale=self.record_mad_scale,
+                clip=self.record_mad_clip,
+            )
 
         # 레코드당 비트 수 제한 (랜덤, lead-flattened 이후에 적용)
         limit = self.max_per_rec * L if self.max_per_rec else beats.shape[0]
@@ -215,13 +242,27 @@ class HEEDBBeatDataset(Dataset):
         return {"beat": torch.from_numpy(beat.astype(np.float32))}
 
     def _refill_buffer(self):
-        """유효 beats가 나올 때까지 최대 8 record 시도. 실패 시 빈 버퍼 유지."""
+        """유효 beats가 나올 때까지 최대 8 record 시도. 실패 시 빈 버퍼 유지.
+
+        Cache 우선 조회 — hit 시 R-peak/resample/normalize 모두 skip.
+        Miss 시 처리 후 LRU에 저장 (cap 초과 시 oldest pop).
+        """
         for _ in range(8):
             f = self.files[random.randrange(len(self.files))]
-            arr = self._extract_record_beats(f)
+            arr = self._record_cache.get(f)
+            if arr is not None:
+                self._record_cache.move_to_end(f)  # LRU bump
+                self._cache_hits += 1
+            else:
+                arr = self._extract_record_beats(f)
+                self._cache_misses += 1
+                if arr is not None and len(arr) > 0:
+                    self._record_cache[f] = arr
+                    while len(self._record_cache) > self._cache_cap:
+                        self._record_cache.popitem(last=False)
             if arr is not None and len(arr) > 0:
-                np.random.shuffle(arr)   # 동일 record 연속 공급 시 lead 혼합
-                self._buf = arr
+                # permutation = 새 array 생성 → cache 원본 손상 없음
+                self._buf = arr[np.random.permutation(len(arr))]
                 self._buf_idx = 0
                 return
         self._buf = None

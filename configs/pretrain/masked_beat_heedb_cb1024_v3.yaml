@@ -1,0 +1,128 @@
+# ── Pre-training v3 (Masked Beat Modeling, HEEDB) — codebook=1024 ───────────
+#
+# v3 변경사항 (vs v2):
+#   D-1) data.normalize: zscore → record_mad
+#        per-beat per-lead z-score는 V1↔V6 amplitude를 정규화로 지움.
+#        record-level (median, p75) scaling으로 inter-lead 신호 차이 보존.
+#   D-2) num_layers: 8 → 12
+#        v2는 d_model 256→512로 width만 키움 (over-parametrize). depth를
+#        늘려서 hierarchical morphology 추상화 capacity를 확장.
+#   D-3) span_length: 10 → 3, beat_mask_ratio max 0.8 → 0.5
+#        ECG는 beat 간 redundancy가 크므로 vision의 MAE-style 0.8 마스킹은
+#        과함. v2는 ep20부터 dominant token shortcut 학습.
+#   D-4) mask_ratio warmup: 0.15 → 0.5 over 50 epochs (linear)
+#        초반에 쉬운 task로 representation 안착, 그 다음 어려운 task로 강화.
+#   D-5) lead_dropout 0.4 → 0.15, min_leads 6 → 10
+#        v2의 lead_dropout 0.4는 다운스트림 (12-lead) 분포와 큰 shift 발생.
+#        0.15 + min_leads=10 → 평균 ~1.8 lead만 가림 → 정규화 정도로 약화.
+#   D-6) early_stop_metric: val_loss → val_acc_nontop
+#        v2의 val_loss는 dominant token 예측이 좋아져서 떨어졌지만 acc_nontop
+#        (희귀 token 예측 정확도)은 단조 감소하던 모드 붕괴 발생.
+#        acc_nontop 기준 → 진짜 representation quality로 stop.
+#   D-7) contrastive auxiliary loss 추가 (SimCLR-style on per-record CLS)
+#        같은 record의 두 augmented view가 가까워지도록 학습 → patient-level
+#        discrimination 강화 (zzu_pecg 등 long-tail task에 효과 기대).
+#   D-8) tokenizer dependency: cb1024_v2 → cb1024_v3 (record_mad input)
+#
+# 호환성: 새 ckpt는 model_cfg에 normalize/contrastive 메타가 들어가서
+# benchmark/src/encoders/ecg_fm_hb.py 가 자동 감지함.
+data:
+  source: heedb
+  train_list: /home/irteam/local-node-d/hbkimi/ecg-fm/file_lists/train_files.txt
+  val_list:   /home/irteam/local-node-d/hbkimi/ecg-fm/file_lists/val_files.txt
+  target_fs: 500
+  beat_length: 256
+  before_ms: 200
+  after_ms: 400
+  normalize: record_mad                   # ★ D-1
+  record_mad_scale: 5.0
+  n_leads: 12
+  max_beats_per_lead: 30
+  stft_n_fft: 256
+  stft_hop: 64
+  seed: 42
+  fiducial:
+    q_window_ms: 50
+    s_window_ms: 80
+
+  # RR / fiducial target z-score statistics (clinical priors).
+  normalization:
+    rr_mean:  [0.85, 0.85, 0.85]
+    rr_std:   [0.20, 0.20, 0.15]
+    fid_mean: [0.030, 0.040]
+    fid_std:  [0.015, 0.020]
+
+tokenizer:
+  ckpt: checkpoints/tokenizer_heedb_full_cb1024_v3/best.pt   # ★ D-8
+  codebook_size: 1024
+  latent_dim: 256
+
+model:
+  d_model: 512
+  nhead: 8
+  num_layers: 12                          # ★ D-2: 8 → 12
+  dim_feedforward: 2048
+  dropout: 0.1
+  max_seq_len: 384
+  context:
+    rhythm_input_dim: 3
+    rhythm_hidden: 256
+    global_context_dim: 512
+    stft_channels: [16, 32, 64]
+
+masking:
+  mask_strategy: span
+  span_length: 3                          # ★ D-3: 10 → 3
+  beat_mask_ratio: 0.5                    # ★ D-3: 0.8 → 0.5 (max value)
+  rhythm_mask_ratio: 0.5                  # ★ D-3: 0.8 → 0.5
+
+  # ★ D-4: linear warmup of mask ratio (0.15 → 0.5 over 50 epochs)
+  mask_warmup_epochs: 50
+  mask_warmup_schedule: linear            # constant | linear | cosine
+  mask_start_ratio: 0.15
+
+  lead_dropout_prob: 0.15                 # ★ D-5: 0.4 → 0.15
+  lead_dropout_schedule: linear
+  lead_dropout_warmup_epochs: 50
+  lead_dropout_min_leads: 10              # ★ D-5: 6 → 10
+
+training:
+  batch_size: 32
+  lr: 3e-4
+  weight_decay: 1e-4
+  max_epochs: 200
+  warmup_epochs: 20
+  grad_clip: 1.0
+  num_workers: 12
+  prefetch_factor: 8
+
+  early_stop_metric: val_acc_nontop       # ★ D-6: val_loss → val_acc_nontop (higher is better)
+  early_stop_patience: 10
+
+  loss:
+    morphology_weight: 1.0
+    rhythm_weight: 1.0
+    fiducial_weight: 1.0
+    class_balanced_alpha: 0.5
+
+  # ★ D-7: SimCLR-style contrastive auxiliary loss on per-record CLS pair.
+  #   - Positive : two augmented views of the same record (different masking
+  #                + lead_dropout RNG state).
+  #   - Negative : every other record in the global (cross-rank) batch
+  #                — both view-1 and view-2 → 2·(N−1) negatives per anchor.
+  #   - DDP : all_gather pools negatives across ranks; only the local rank
+  #           keeps gradient on its own embeddings (safe SimCLR-DDP idiom).
+  #   - The projection MLP is discarded after pretraining; downstream uses
+  #     raw transformer CLS, not the projected embedding.
+  contrastive:
+    weight: 0.3                           # final weight (after warmup)
+    temperature: 0.1                      # NT-Xent τ
+    proj_hidden: 512                      # MLP hidden (default = d_model)
+    proj_out: 128                         # projection output dim
+    warmup_epochs: 5                      # 0 → weight linear ramp
+
+  log_dir:  logs/pretrain_heedb_cb1024_v3
+  tb_dir:   logs/tb/pretrain/cb1024_v3
+  ckpt_dir: checkpoints/pretrain_heedb_cb1024_v3
+  save_every: 10
+  eval_every: 5
