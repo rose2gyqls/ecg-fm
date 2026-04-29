@@ -181,7 +181,10 @@ def main():
     sel_idx = sorted(rng.choice(
         len(files), size=min(args.val_records, len(files)), replace=False
     ).tolist())
-    eval_list = "/tmp/eval_val_list_v4.txt"
+    # Use a per-ckpt-dir tmp path so parallel evaluations don't race on the
+    # same file (matters when running CPU eval for multiple cbs concurrently).
+    _tag = os.path.basename(args.ckpt_dir.rstrip("/")) or "default"
+    eval_list = f"/tmp/eval_val_list_{_tag}.txt"
     with open(eval_list, "w") as f:
         for i in sel_idx:
             f.write(files[i] + "\n")

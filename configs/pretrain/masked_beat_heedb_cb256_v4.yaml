@@ -1,0 +1,91 @@
+# ── Pre-training v4 (Masked Beat Modeling, HEEDB) — codebook=256 ────────────
+# v4 변경사항은 masked_beat_heedb_cb512_v4.yaml 헤더 참조.
+data:
+  source: heedb
+  train_list: /home/irteam/local-node-d/hbkimi/ecg-fm/file_lists/train_files.txt
+  val_list:   /home/irteam/local-node-d/hbkimi/ecg-fm/file_lists/val_files.txt
+  target_fs: 500
+  beat_length: 256
+  before_ms: 200
+  after_ms: 400
+  normalize: record_mad
+  record_mad_scale: 5.0
+  n_leads: 12
+  max_beats_per_lead: 30
+  stft_n_fft: 256
+  stft_hop: 64
+  seed: 42
+  fiducial:
+    q_window_ms: 50
+    s_window_ms: 80
+
+  normalization:
+    rr_mean:  [0.85, 0.85, 0.85]
+    rr_std:   [0.20, 0.20, 0.15]
+    fid_mean: [0.030, 0.040]
+    fid_std:  [0.015, 0.020]
+
+tokenizer:
+  ckpt: checkpoints/tokenizer_heedb_full_cb256_v4/best.pt
+  codebook_size: 256
+  latent_dim: 256
+
+model:
+  d_model: 512
+  nhead: 8
+  num_layers: 12
+  dim_feedforward: 2048
+  dropout: 0.1
+  max_seq_len: 384
+  context:
+    rhythm_input_dim: 3
+    rhythm_hidden: 256
+    global_context_dim: 512
+    stft_channels: [16, 32, 64]
+
+masking:
+  mask_strategy: span
+  span_length: 3
+  beat_mask_ratio: 0.5
+  rhythm_mask_ratio: 0.5
+
+  mask_warmup_epochs: 50
+  mask_warmup_schedule: linear
+  mask_start_ratio: 0.15
+
+  lead_dropout_prob: 0.15
+  lead_dropout_schedule: linear
+  lead_dropout_warmup_epochs: 50
+  lead_dropout_min_leads: 10
+
+training:
+  batch_size: 64                       # ★ v4: 32 → 64 (4-GPU effective 256)
+  lr: 3e-4
+  weight_decay: 1e-4
+  max_epochs: 200
+  warmup_epochs: 20
+  grad_clip: 1.0
+  num_workers: 18                      # ★ v4: 12 → 18 (4 GPU × 18 = 72 workers)
+  prefetch_factor: 8
+
+  early_stop_metric: val_acc_nontop
+  early_stop_patience: 10
+
+  loss:
+    morphology_weight: 1.0
+    rhythm_weight: 1.0
+    fiducial_weight: 1.0
+    class_balanced_alpha: 0.5
+
+  contrastive:
+    weight: 0.3
+    temperature: 0.1
+    proj_hidden: 512
+    proj_out: 128
+    warmup_epochs: 5
+
+  log_dir:  logs/pretrain_heedb_cb256_v4
+  tb_dir:   logs/tb/pretrain/cb256_v4
+  ckpt_dir: checkpoints/pretrain_heedb_cb256_v4
+  save_every: 10
+  eval_every: 5
