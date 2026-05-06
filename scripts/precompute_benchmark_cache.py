@@ -182,8 +182,15 @@ def _collect_h5_paths(
     benchmark_repo: Path,
     task_name: str,
     data_root: str,
+    from_label_csv: bool = False,
 ) -> list[tuple[str, int]]:
-    """Read configs/tasks/<task>.yaml and dedup (abs_path, seg_idx) tuples."""
+    """Read configs/tasks/<task>.yaml and dedup (abs_path, seg_idx) tuples.
+
+    By default the path list comes from data.table_csv (the master table for
+    a dataset). When `from_label_csv=True`, reads data.label_csv instead —
+    useful when the table covers more records than the actual task cohort
+    (e.g. MIMIC: master table 800k vs task label CSVs ~120k–185k).
+    """
     cfg_path = benchmark_repo / "configs" / "tasks" / f"{task_name}.yaml"
     if not cfg_path.exists():
         print(f"[warn] {task_name}: config not found at {cfg_path}")
@@ -197,15 +204,31 @@ def _collect_h5_paths(
     env = {"ECG_DATA_ROOT": data_root}
     h5_root = _expand_env(data.get("h5_root", ""), env)
     table_csv = _expand_env(data.get("table_csv", ""), env)
+    label_csv_raw = data.get("label_csv", "")
+    # label_csv 는 보통 repo-relative (e.g. labels/mimic_age_paper_labels.csv)
+    label_csv = _expand_env(label_csv_raw, env) if label_csv_raw else ""
+    if label_csv and not os.path.isabs(label_csv):
+        label_csv = str(benchmark_repo / label_csv)
     seg_idx_cfg = data.get("seg_idx", None)
     if not h5_root or not table_csv:
         print(f"[warn] {task_name}: h5_root/table_csv missing")
         return []
-    if not os.path.exists(table_csv):
-        print(f"[warn] {task_name}: table not found {table_csv}")
+
+    if from_label_csv:
+        if not label_csv or not os.path.exists(label_csv):
+            print(f"[warn] {task_name}: label_csv not found {label_csv} — "
+                  "falling back to table_csv")
+            scan_csv = table_csv
+        else:
+            scan_csv = label_csv
+    else:
+        scan_csv = table_csv
+
+    if not os.path.exists(scan_csv):
+        print(f"[warn] {task_name}: scan csv not found {scan_csv}")
         return []
 
-    df = pd.read_csv(table_csv, usecols=["filepath"], low_memory=False)
+    df = pd.read_csv(scan_csv, usecols=["filepath"], low_memory=False)
     paths = []
     if seg_idx_cfg == "all":
         # Need to expand per-record segments. For simplicity here, only seg=0;
@@ -242,6 +265,9 @@ def main():
                     help="Stop after N items (smoke test)")
     ap.add_argument("--dry-run", action="store_true",
                     help="Just print task→count summary; don't compute")
+    ap.add_argument("--from-label-csv", action="store_true",
+                    help="Enumerate paths from data.label_csv instead of "
+                         "data.table_csv (use for MIMIC: cohort ≪ master table)")
     args = ap.parse_args()
 
     benchmark_repo = Path(args.benchmark_repo).resolve()
@@ -256,7 +282,8 @@ def main():
     seen = set()
     print(f"[scan] tasks={tasks}")
     for t in tasks:
-        items = _collect_h5_paths(benchmark_repo, t, args.data_root)
+        items = _collect_h5_paths(benchmark_repo, t, args.data_root,
+                                  from_label_csv=args.from_label_csv)
         new = [it for it in items if it not in seen]
         seen.update(items)
         all_items.extend(new)

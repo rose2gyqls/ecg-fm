@@ -58,12 +58,14 @@ TASK_ORDER = [
 TASK_DISPLAY = dict(TASK_ORDER)
 TASK_INDEX = {t: i for i, (t, _) in enumerate(TASK_ORDER)}
 
-CB_RE = re.compile(r"ecg_fm_hb_cb(\d+)__")
+# Matches both v4 tag (ecg_fm_hb_cb<K>__...) and v5 tag (ecg_fm_hb_cb<K>_v<N>__...).
+CB_RE = re.compile(r"ecg_fm_hb_cb(\d+)(?:_v\d+)?__")
 
 
 def latest_results_csv() -> Path | None:
+    # Match v4 (results/<TS>_ecg_fm_hb) and v5 (results/<TS>_ecg_fm_hb_v5).
     candidates = sorted(
-        Path("/home/irteam/local-node-d/hbkimi/benchmark/results").glob("*_ecg_fm_hb"),
+        Path("/home/irteam/local-node-d/hbkimi/benchmark/results").glob("*_ecg_fm_hb*"),
         key=lambda p: p.stat().st_mtime,
     )
     for d in reversed(candidates):

@@ -107,6 +107,59 @@ class GlobalContextCNN(nn.Module):
         return self.project(h)
 
 
+class STFTGlobalEncoder(nn.Module):
+    """
+    v5 (MoRyECG) global STFT encoder. Same Conv2d-AdaptiveAvgPool-Linear
+    skeleton as `GlobalContextCNN` but configurable channel widths so the
+    encoder capacity can be cut down (default v5: [8, 16, 32]) and an
+    optional STFT-bin dropout right after the input.
+
+    The smaller capacity is one of three leakage-prevention measures listed
+    in §10 of the v5 spec; combined with the lead-mask and the beat-aligned
+    STFT-time mask applied by train_v5, the [GLOB] token cannot directly
+    short-circuit the masked morphology codes.
+
+    Input : (B, n_leads, F, T')
+    Output: (B, d_model)
+    """
+
+    def __init__(
+        self,
+        in_channels: int = 12,
+        channels: tuple = (8, 16, 32),
+        d_model: int = 256,
+        input_dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.input_dropout = float(input_dropout)
+        # Dropout3d on (B, C, F, T') zeroes out random feature channels —
+        # the standard 2D feature dropout adapted to the (F, T') spatial map.
+        # We use it only when explicitly enabled by config.
+        if self.input_dropout > 0:
+            self.in_drop = nn.Dropout3d(p=self.input_dropout)
+        else:
+            self.in_drop = nn.Identity()
+        layers = []
+        in_ch = int(in_channels)
+        for out_ch in channels:
+            out_ch = int(out_ch)
+            layers += [
+                nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=2, padding=1, bias=False),
+                nn.BatchNorm2d(out_ch),
+                nn.GELU(),
+            ]
+            in_ch = out_ch
+        self.cnn = nn.Sequential(*layers)
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.project = nn.Linear(in_ch, d_model)
+
+    def forward(self, stft: torch.Tensor) -> torch.Tensor:
+        h = self.in_drop(stft)
+        h = self.cnn(h)
+        h = self.pool(h).flatten(1)
+        return self.project(h)
+
+
 class MorphologyEmbedding(nn.Embedding):
     """
     Codebook index -> (d_model,). Includes one extra row for the [MASK] token.

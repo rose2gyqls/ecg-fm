@@ -52,6 +52,11 @@ DEVICE="${DEVICE:-cuda}"
 # Pretrain checkpoint pattern: best.pt by default; override to last.pt for cb128.
 CKPT_BASENAME="${CKPT_BASENAME:-best.pt}"
 
+# Pretrain version: v4 (default) or v5 (MoRyECG arch). The encoder adapter
+# auto-routes via model_cfg["arch"], so the only thing that changes here is
+# the checkpoint directory: pretrain_heedb_cb${K}_${VERSION}.
+VERSION="${VERSION:-v4}"
+
 # Output root — one timestamp shared across all (size, task, mode) tuples so
 # the auto-generated results_all.csv aggregates them.
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
@@ -89,14 +94,14 @@ cd "${BENCHMARK_REPO}"
 # ── Run loop ─────────────────────────────────────────────────────────────
 fail=0
 for K in ${SIZES}; do
-    CKPT="${ECG_FM_HB_REPO}/checkpoints/pretrain_heedb_cb${K}_v4/${CKPT_BASENAME}"
+    CKPT="${ECG_FM_HB_REPO}/checkpoints/pretrain_heedb_cb${K}_${VERSION}/${CKPT_BASENAME}"
     if [[ ! -f "${CKPT}" ]]; then
-        echo "[skip] cb${K}: checkpoint not found at ${CKPT}"
+        echo "[skip] cb${K}_${VERSION}: checkpoint not found at ${CKPT}"
         continue
     fi
     for TASK in ${TASKS}; do
         for MODE in ${EVAL_MODES}; do
-            tag="ecg_fm_hb_cb${K}__${TASK}__${MODE}"
+            tag="ecg_fm_hb_cb${K}_${VERSION}__${TASK}__${MODE}"
             save_dir="${OUT_ROOT}/${tag}"
             log_file="${OUT_ROOT}/${tag}.log"
             if [[ -d "${save_dir}" ]] && [[ -f "${save_dir}/test_metrics.txt" || -f "${save_dir}/val_metrics.txt" ]]; then
