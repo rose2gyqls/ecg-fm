@@ -8,7 +8,7 @@
 #     entropy bonus + commit/EMA tuned)를 frozen으로 사용.
 #   - pretrain side hyperparam(MLM + RR + fid + SimCLR contrastive,
 #     mask curriculum, lead_dropout, val_acc_nontop early stop)은 v3 그대로.
-#   - 토크나이저 효과 단독 측정. 추후 pretrain 자체 ablation은 v5.
+#   - 토크나이저 효과 단독 측정.
 #
 # 각 run의 ckpt/log는 분리 저장:
 #   checkpoints/pretrain_heedb_cb{N}_v4/{best,last,epoch_*}.pt
@@ -18,14 +18,14 @@
 #   nohup ./scripts/run_pretrain_ablation_v4.sh > pretrain_ablation_v4.log 2>&1 &
 #
 # Override:
-#   GPUS=0,1,2,3,4,5,6  ./scripts/run_pretrain_ablation_v4.sh   # 7장 사용 (default)
+#   GPUS=0,1,2,3,4,5,6  ./scripts/run_pretrain_ablation_v4.sh   # custom GPUs
 #   ONLY=cb512          ./scripts/run_pretrain_ablation_v4.sh   # 단일 config (쉼표 구분)
 #   SKIP=cb128          ./scripts/run_pretrain_ablation_v4.sh   # 특정 config 제외
 #   FORCE_RESTART=1     ./scripts/run_pretrain_ablation_v4.sh   # 완료 stamp 무시 재실행
 
 set -euo pipefail
 
-# ── 사용할 GPU (default: 7장) ────────────────────────────────────────────────
+# ── 사용할 GPU (default: 4장) ────────────────────────────────────────────────
 GPUS=${GPUS:-0,1,2,3}
 NPROC=$(awk -F, '{print NF}' <<< "$GPUS")
 
@@ -33,10 +33,15 @@ NPROC=$(awk -F, '{print NF}' <<< "$GPUS")
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJECT_ROOT"
 
-HBKIM_BIN=${HBKIM_BIN:-/home/irteam/local-node-d/_conda/envs/hbkim/bin}
-export PATH="$HBKIM_BIN:$PATH"
-PY="$HBKIM_BIN/python"
-TORCHRUN="$HBKIM_BIN/torchrun"
+HBKIM_BIN=${HBKIM_BIN:-}
+if [ -n "$HBKIM_BIN" ]; then
+  export PATH="$HBKIM_BIN:$PATH"
+  PY="$HBKIM_BIN/python"
+  TORCHRUN="$HBKIM_BIN/torchrun"
+else
+  PY=${PYTHON:-python}
+  TORCHRUN=${TORCHRUN:-torchrun}
+fi
 
 export CUDA_VISIBLE_DEVICES="$GPUS"
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}

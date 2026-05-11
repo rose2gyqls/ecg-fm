@@ -2,11 +2,11 @@
 Phase 3: Masked beat modeling pre-training (DDP-aware).
 
 Single GPU:
-    python -m training.pretrain.train --config configs/pretrain/masked_beat_heedb.yaml
+    python -m training.pretrain.train --config configs/pretrain/masked_beat_heedb_cb1024_v4.yaml
 
 Multi-GPU:
     CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6 torchrun --nproc_per_node=7 \
-        -m training.pretrain.train --config configs/pretrain/masked_beat_heedb.yaml
+        -m training.pretrain.train --config configs/pretrain/masked_beat_heedb_cb1024_v4.yaml
 """
 
 import argparse
@@ -854,7 +854,7 @@ def _load_tok_cfg(cfg, ckpt=None):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", default="configs/pretrain/masked_beat_heedb.yaml")
+    parser.add_argument("--config", default="configs/pretrain/masked_beat_heedb_cb1024_v4.yaml")
     parser.add_argument("--resume", default=None,
                         help="Checkpoint path to resume from. "
                              "If omitted, ckpt_dir/last.pt is auto-loaded if present.")

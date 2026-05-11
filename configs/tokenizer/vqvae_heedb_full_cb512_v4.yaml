@@ -44,8 +44,8 @@
 
 data:
   source: heedb
-  train_list: /home/irteam/local-node-d/hbkimi/ecg-fm/file_lists/train_files_full.txt
-  val_list:   /home/irteam/local-node-d/hbkimi/ecg-fm/file_lists/val_files_full.txt
+  train_list: file_lists/train_files_full.txt
+  val_list:   file_lists/val_files_full.txt
   target_fs: 500
   beat_length: 256
   before_ms: 200

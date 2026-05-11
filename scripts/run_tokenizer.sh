@@ -2,8 +2,11 @@
 # scripts/run_tokenizer.sh
 # Phase 1: VQ-VAE Beat Tokenizer 학습
 #
+# Default: v4 cb1024 tokenizer config.
+#
 # Usage:
-#   ./scripts/run_tokenizer.sh configs/tokenizer/vqvae_heedb_full_cb512.yaml
+#   ./scripts/run_tokenizer.sh
+#   ./scripts/run_tokenizer.sh configs/tokenizer/vqvae_heedb_full_cb512_v4.yaml
 #
 # GPU 번호는 아래 GPUS 변수를 직접 고쳐서 쓴다. NPROC은 GPUS 개수에서 자동 계산.
 # env로 override도 가능: GPUS=0,1 ./scripts/run_tokenizer.sh configs/...yaml
@@ -20,13 +23,18 @@ NPROC=$(awk -F, '{print NF}' <<< "$GPUS")
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJECT_ROOT"
 
-# hbkim 환경 python/torchrun 직접 지정 (conda activate가 다른 env를 먼저 잡는 문제 회피)
-HBKIM_BIN=${HBKIM_BIN:-/home/irteam/local-node-d/_conda/envs/hbkim/bin}
-export PATH="$HBKIM_BIN:$PATH"
-PY="$HBKIM_BIN/python"
-TORCHRUN="$HBKIM_BIN/torchrun"
+# Optional: point HBKIM_BIN at a specific environment's bin directory.
+HBKIM_BIN=${HBKIM_BIN:-}
+if [ -n "$HBKIM_BIN" ]; then
+  export PATH="$HBKIM_BIN:$PATH"
+  PY="$HBKIM_BIN/python"
+  TORCHRUN="$HBKIM_BIN/torchrun"
+else
+  PY=${PYTHON:-python}
+  TORCHRUN=${TORCHRUN:-torchrun}
+fi
 
-CONFIG=${1:-configs/tokenizer/vqvae_base.yaml}
+CONFIG=${1:-configs/tokenizer/vqvae_heedb_full_cb1024_v4.yaml}
 RESUME=${RESUME:-}    # 명시 경로. 비우면 ckpt_dir/last.pt 자동 로드.
 
 export CUDA_VISIBLE_DEVICES="$GPUS"

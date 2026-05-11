@@ -39,10 +39,15 @@ NPROC=$(awk -F, '{print NF}' <<< "$GPUS")
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJECT_ROOT"
 
-HBKIM_BIN=${HBKIM_BIN:-/home/irteam/local-node-d/_conda/envs/hbkim/bin}
-export PATH="$HBKIM_BIN:$PATH"
-PY="$HBKIM_BIN/python"
-TORCHRUN="$HBKIM_BIN/torchrun"
+HBKIM_BIN=${HBKIM_BIN:-}
+if [ -n "$HBKIM_BIN" ]; then
+  export PATH="$HBKIM_BIN:$PATH"
+  PY="$HBKIM_BIN/python"
+  TORCHRUN="$HBKIM_BIN/torchrun"
+else
+  PY=${PYTHON:-python}
+  TORCHRUN=${TORCHRUN:-torchrun}
+fi
 
 export CUDA_VISIBLE_DEVICES="$GPUS"
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}

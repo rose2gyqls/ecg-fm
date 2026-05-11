@@ -87,9 +87,9 @@ class HEEDBECGDataset(Dataset):
             "rr_feats": torch.zeros(self.max_beats, self.n_leads, 3),
             "fid_feats": torch.zeros(self.max_beats, self.n_leads, 2),
             "stft":     torch.zeros(self.n_leads, F, T_stft),
-            # ── v5: STFT-frame coords for beat-aligned masking ────────────────
+            # STFT-frame coords for beat-aligned masking.
             # (max_beats,) int64 — empty span (start == end) for invalid beats,
-            # so v5's STFT mask construction has no effect on padded slots.
+            # so STFT mask construction has no effect on padded slots.
             "beat_t_starts":   torch.zeros(self.max_beats, dtype=torch.long),
             "beat_t_ends":     torch.zeros(self.max_beats, dtype=torch.long),
             # (max_beats,) bool — True iff this slot holds a real beat.
@@ -185,7 +185,7 @@ class HEEDBECGDataset(Dataset):
                                 n_fft=self.stft_n_fft,
                                 hop_length=self.stft_hop)
 
-        # ── v5: per-beat STFT-frame windows ─────────────────────────────────
+        # Per-beat STFT-frame windows.
         # torch.stft uses center=True, so frame t is centered at sample t*hop
         # and covers [t*hop - n_fft/2, t*hop + n_fft/2). A beat at R-peak r
         # with raw window [r-before, r+after) influences any frame whose
@@ -193,7 +193,7 @@ class HEEDBECGDataset(Dataset):
         # n_fft/2 on each side):
         #     t_start = max(0,    (r - before - n_fft/2) // hop)
         #     t_end   = min(T',   (r + after  + n_fft/2) // hop + 1)
-        # Padded beats keep (0, 0) so the v5 STFT mask is a no-op there.
+        # Padded beats keep (0, 0) so STFT masking is a no-op there.
         before_samples = int(round(fs * self.before_ms / 1000))
         after_samples  = int(round(fs * self.after_ms  / 1000))
         T_stft = stft.shape[-1]
@@ -207,7 +207,7 @@ class HEEDBECGDataset(Dataset):
             te = np.minimum(T_stft,
                             (valid_rpeaks + after_samples + half_fft) // self.stft_hop + 1)
             # Guarantee start < end for valid beats so the broadcast index
-            # arithmetic in train_v5 always sees a non-degenerate span.
+            # arithmetic always sees a non-degenerate span.
             te = np.maximum(te, ts + 1)
             te = np.minimum(te, T_stft)
             beat_t_starts[:n_valid] = ts

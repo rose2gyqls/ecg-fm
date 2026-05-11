@@ -13,8 +13,13 @@ set -e
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJECT_ROOT"
 
-source "$(conda info --base)/etc/profile.d/conda.sh"
-conda activate hbkim
+HBKIM_BIN=${HBKIM_BIN:-}
+if [ -n "$HBKIM_BIN" ]; then
+  export PATH="$HBKIM_BIN:$PATH"
+  PY="$HBKIM_BIN/python"
+else
+  PY=${PYTHON:-python}
+fi
 
 TASK=${1:-arrhythmia}
 
@@ -33,7 +38,7 @@ echo "  Time   : $(date)"
 echo "========================================"
 
 # pretrained checkpoint 확인
-PT_CKPT=$(python -c "
+PT_CKPT=$("$PY" -c "
 import yaml
 with open('$CONFIG') as f: cfg = yaml.safe_load(f)
 print(cfg['base_pretrain_ckpt'])
@@ -45,4 +50,4 @@ if [ ! -f "$PT_CKPT" ]; then
 fi
 echo "  Pretrain ckpt: $PT_CKPT  ✓"
 
-python -m training.finetune.train --config "$CONFIG"
+"$PY" -m training.finetune.train --config "$CONFIG"

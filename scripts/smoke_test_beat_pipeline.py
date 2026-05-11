@@ -1,6 +1,7 @@
-"""
-Smoke test: R-peak 검증 + noise filter가 제대로 동작하는지 몇 레코드로 확인.
-"""
+"""Smoke test for R-peak validation, beat extraction, and noise filtering."""
+from __future__ import annotations
+
+import argparse
 import os
 import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -21,7 +22,7 @@ from data.datasets.heedb_beat_dataset  import HEEDBBeatDataset
 FS          = 500
 BEFORE_MS   = 200
 AFTER_MS    = 400
-FILELIST    = "/home/irteam/local-node-d/hbkimi/ecg-fm/file_lists/train_files_full.txt"
+FILELIST    = os.environ.get("HEEDB_FILELIST", "file_lists/train_files_full.txt")
 N_RECORDS   = 30
 
 
@@ -109,18 +110,23 @@ def run_dataset_level(filelist_path, n_draws=200):
 
 
 def main():
-    random.seed(0)
-    with open(FILELIST) as f:
-        all_files = [ln.strip() for ln in f if ln.strip()]
-    sample = random.sample(all_files, N_RECORDS)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--filelist", default=FILELIST)
+    parser.add_argument("--n-records", type=int, default=N_RECORDS)
+    args = parser.parse_args()
 
-    print(f"[record-level] {N_RECORDS} records")
+    random.seed(0)
+    with open(args.filelist) as f:
+        all_files = [ln.strip() for ln in f if ln.strip()]
+    sample = random.sample(all_files, args.n_records)
+
+    print(f"[record-level] {args.n_records} records")
     s = run_record_level(sample)
     for k, v in s.items():
         print(f"  {k:30s} {v}")
 
     print("\n[dataset-level] sampling via __getitem__")
-    d = run_dataset_level(FILELIST, n_draws=200)
+    d = run_dataset_level(args.filelist, n_draws=200)
     for k, v in d.items():
         print(f"  {k:30s} {v}")
 

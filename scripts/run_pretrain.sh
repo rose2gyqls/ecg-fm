@@ -2,10 +2,10 @@
 # scripts/run_pretrain.sh
 # Phase 3: ECG Foundation Model Pre-training (Masked Beat Modeling)
 #
-# Default: GPU 0-6 (7개) DDP
+# Default: v4 cb1024 pre-training config on GPU 0-6 (7개) DDP
 # Usage:
 #   bash scripts/run_pretrain.sh                                  # GPU 0,1,2,3,4,5,6
-#   bash scripts/run_pretrain.sh configs/pretrain/xxx.yaml
+#   bash scripts/run_pretrain.sh configs/pretrain/masked_beat_heedb_cb512_v4.yaml
 #   GPUS=0,1 bash scripts/run_pretrain.sh                         # custom GPUs
 #   GPUS=0   bash scripts/run_pretrain.sh                         # single GPU
 
@@ -14,10 +14,17 @@ set -e
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJECT_ROOT"
 
-source "$(conda info --base)/etc/profile.d/conda.sh"
-conda activate hbkim
+HBKIM_BIN=${HBKIM_BIN:-}
+if [ -n "$HBKIM_BIN" ]; then
+  export PATH="$HBKIM_BIN:$PATH"
+  PY="$HBKIM_BIN/python"
+  TORCHRUN="$HBKIM_BIN/torchrun"
+else
+  PY=${PYTHON:-python}
+  TORCHRUN=${TORCHRUN:-torchrun}
+fi
 
-CONFIG=${1:-configs/pretrain/masked_beat_heedb.yaml}
+CONFIG=${1:-configs/pretrain/masked_beat_heedb_cb1024_v4.yaml}
 GPUS=${GPUS:-0,1,2,3,4,5,6}
 NPROC=$(echo "$GPUS" | tr ',' '\n' | wc -l)
 
@@ -29,7 +36,7 @@ echo "  Time   : $(date)"
 echo "========================================"
 
 # tokenizer ckpt 존재 확인
-TOK_CKPT=$(python -c "
+TOK_CKPT=$("$PY" -c "
 import yaml
 with open('$CONFIG') as f: cfg = yaml.safe_load(f)
 print(cfg['tokenizer']['ckpt'])
@@ -48,10 +55,10 @@ export OMP_NUM_THREADS=4
 export MKL_NUM_THREADS=4
 
 if [ "$NPROC" = "1" ]; then
-    python -m training.pretrain.train --config "$CONFIG"
+    "$PY" -m training.pretrain.train --config "$CONFIG"
 else
     # master_port를 randomize 해서 여러 학습이 동시 실행되어도 충돌 방지
     PORT=$((10000 + RANDOM % 50000))
-    torchrun --nproc_per_node=$NPROC --master_port=$PORT \
+    "$TORCHRUN" --nproc_per_node=$NPROC --master_port=$PORT \
         -m training.pretrain.train --config "$CONFIG"
 fi

@@ -6,6 +6,8 @@ __pycache__/
 
 # data / artifacts
 logs/
+notebooks/
+file_lists/*.txt
 checkpoints/
 wandb/
 runs/

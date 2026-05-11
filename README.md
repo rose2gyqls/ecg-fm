@@ -1,8 +1,8 @@
 # ECG Foundation Model — Beat-level VQ-VAE + Masked Beat Modeling + Contrastive
 
-12-lead ECG에서 **beat 단위 VQ-VAE 토크나이저**로 morphology를 이산 토큰으로 양자화하고, 그 위에 **Masked Beat Modeling + per-record SimCLR contrastive** Transformer foundation model을 학습한다. HEEDB(11.23M record) H5 데이터를 직접 streaming으로 읽어 5~7-GPU DDP로 학습.
+12-lead ECG에서 **beat 단위 VQ-VAE 토크나이저**로 morphology를 이산 토큰으로 양자화하고, 그 위에 **Masked Beat Modeling + per-record SimCLR contrastive** Transformer foundation model을 학습한다. HEEDB(11.23M record) H5 데이터를 직접 streaming으로 읽어 DDP로 학습한다.
 
-현재 메인 lineage는 **v3** — v2 진단 (V1↔V6 codebook collapse, dominant-token shortcut, val_loss 가짜 개선) 결과를 반영해 record-level normalization, mask-ratio warmup, contrastive auxiliary loss를 도입.
+현재 제출용 최종 lineage는 **v4** — v3의 masked-beat pretraining objective는 유지하고, tokenizer 쪽 안정성 문제(record_mad outlier amplification, codebook EMA drift, dead-code restart shock)를 수정한 버전이다.
 
 ---
 
@@ -44,36 +44,32 @@
 
 ---
 
-## v3 (현재 메인) 핵심 변경
+## v4 핵심 변경
 
-| 영역 | v2 | **v3** | 이유 |
-|---|---|---|---|
-| 입력 정규화 | per-beat per-lead z-score | **per-record (median, p75·5)** | V1↔V6 amplitude 보존. v2에서 6 precordial이 같은 codebook 코드로 압축되던 문제 해결. |
-| Transformer depth | 8 layers, d=512 | **12 layers, d=512** | width-only over-parametrization 대신 hierarchical capacity. |
-| Mask span | 10 beat (cross-lead aligned) | **3 beat** | 0.8 ratio + span 10 = MAE 수준 가혹 → ECG redundancy 고려해 완화. |
-| Beat mask ratio | 0.8 (constant) | **0.15 → 0.5 over 50 ep (linear warmup)** | 초반 쉬운 task로 representation 안착 후 강화. |
-| Rhythm mask ratio | 0.8 (constant) | 0.5 (warmup 동일) | beat과 동일 schedule. |
-| Lead dropout | 0.4, min_leads=6 | **0.15, min_leads=10** | 다운스트림(12-lead) 분포와의 shift 최소화. |
-| Early-stop metric | val_loss | **val_acc_nontop** | v2의 val_loss는 dominant token shortcut으로 떨어졌고 acc_nontop은 단조 감소했음. acc_nontop이 representation quality의 직접 지표. |
-| Contrastive aux | — | **SimCLR NT-Xent on (cls₁, cls₂)**, w=0.3, τ=0.1, warmup 5 ep | Patient-level discrimination 강화. zzu_pecg 등 long-tail에 효과 기대. |
+| 영역 | **v4** | 이유 |
+|---|---|---|
+| Tokenizer 정규화 | `record_mad_min_scale=0.05`, `record_mad_clip=8.0` | isoelectric lead가 scale floor에 걸리며 QRS가 과증폭되던 batch spike 차단. |
+| Codebook EMA | `ema_decay=0.97`, `commitment_cost=0.25` | encoder drift를 EMA codebook이 늦게 따라가던 desync 완화. |
+| Codebook usage | entropy regularizer `loss.delta=0.05` | V1~V6가 같은 dominant token으로 뭉치는 collapse 완화. |
+| Dead-code restart | `restart_dead_every=2000`, `restart_dead_threshold=0.1` | restart shock 빈도와 강도 축소. |
+| Tokenizer LR | `warmup_epochs=5` 실제 적용 | 초반 codebook/encoder 안착 안정화. |
+| Best checkpoint | `best_window=5` smoothed val_loss | single validation outlier가 best.pt를 잠그는 문제 완화. |
+| Pretrain objective | v3 objective 유지: MLM + RR + fiducial + SimCLR contrastive | tokenizer 개선 효과를 pretrain ablation에 단독 반영. |
 
-v1/v2 계보는 그대로 보존 (`*_v2.yaml`, `checkpoints/*_v2/`)되어 ablation 비교 가능.
+제출용 실행 경로는 `*_v4.yaml`, `run_tokenizer_ablation_v4.sh`, `run_pretrain_ablation_v4.sh`, `training/pretrain/train.py` 기준이다.
 
 ---
 
 ## 환경 설정
 
 ```bash
-# 이미 서버에 있는 conda env 사용
-conda activate hbkim
-# 또는 binary 직접 사용
-HBKIM_BIN=/home/irteam/local-node-d/_conda/envs/hbkim/bin
-$HBKIM_BIN/python -m training.tokenizer.train --config ...
+conda env create -f environment.yaml
+conda activate ecg-fm
 ```
 
-모든 launcher script (`scripts/run_*.sh`)는 내부적으로 `hbkim` env를 활성화한다.
+기존 환경을 쓰는 경우에는 `python`/`torchrun`이 PATH에 있으면 된다. 특정 환경의 binary를 직접 지정하려면 `HBKIM_BIN=/path/to/env/bin`을 넘긴다.
 
-> 신규 env 만들 때: `conda env create -f environment.yaml` → `pip install neurokit2 wfdb h5py scikit-learn tensorboard`
+> 필요한 경우: `pip install neurokit2 wfdb h5py scikit-learn tensorboard`
 
 ---
 
@@ -83,13 +79,9 @@ $HBKIM_BIN/python -m training.tokenizer.train --config ...
 ecg-fm/
 ├── configs/
 │   ├── tokenizer/
-│   │   ├── vqvae_heedb_full_cb{256,512,1024,2048}.yaml      # v1 (legacy)
-│   │   ├── vqvae_heedb_full_cb{256,512,1024,2048}_v2.yaml   # v2 (cosine VQ, multi-scale STFT)
-│   │   └── vqvae_heedb_full_cb{256,512,1024,2048}_v3.yaml   # ★ v3 (record_mad)
+│   │   └── vqvae_heedb_full_cb{128,256,512,1024,2048}_v4.yaml
 │   ├── pretrain/
-│   │   ├── masked_beat_heedb.yaml                            # v1 base
-│   │   ├── masked_beat_heedb_cb{256,512,1024,2048}_v2.yaml   # v2
-│   │   └── masked_beat_heedb_cb{256,512,1024,2048}_v3.yaml   # ★ v3 (mask warmup, contrastive)
+│   │   └── masked_beat_heedb_cb{128,256,512,1024,2048}_v4.yaml
 │   └── finetune/
 │       └── arrhythmia.yaml                                    # template; 실제 finetune은 benchmark/ 에서
 │
@@ -136,10 +128,8 @@ ecg-fm/
 │   ├── run_tokenizer.sh               # Phase 1 launcher (단일 config)
 │   ├── run_pretrain.sh                # Phase 3 launcher
 │   ├── run_finetune.sh                # Phase 4 launcher (template)
-│   ├── run_tokenizer_ablation_v2.sh   # v2 4-codebook sweep (legacy)
-│   ├── run_tokenizer_ablation_v3.sh   # ★ v3 4-codebook sweep
-│   ├── run_pretrain_ablation_v2.sh    # v2 pretrain sweep (legacy)
-│   ├── run_pretrain_ablation_v3.sh    # ★ v3 pretrain sweep
+│   ├── run_tokenizer_ablation_v4.sh   # v4 tokenizer codebook sweep
+│   ├── run_pretrain_ablation_v4.sh    # v4 pretrain codebook sweep
 │   └── build_full_heedb_filelist.py   # HEEDB → train/val 파일 리스트 (seed=42)
 │
 ├── file_lists/                        # train/val .txt
@@ -151,47 +141,45 @@ ecg-fm/
 
 ## 데이터 — HEEDB
 
-- **루트**: `/home/irteam/ddn-opendata1/h5/heedb`
+- **루트**: HEEDB H5 파일이 있는 로컬 경로 (`--heedb-root` 또는 `HEEDB_ROOT`)
 - **포맷**: `ECG/segments/0/signal` (12, T) float16, `metadata.attrs["fs"]`, `beat_annotation/sample` (있으면)
 - **lead 순서**: `I, II, III, V1, V2, V3, V4, V5, V6, aVF, aVL, aVR` ([data/preprocessing/heedb_io.py:19](data/preprocessing/heedb_io.py#L19))
 - **R-peak**: HEEDB 내장 annotation은 무시하고 **항상 Lead II + neurokit2** 로 재검출 ([heedb_beat_dataset.py:111](data/datasets/heedb_beat_dataset.py#L111))
 - **target_fs=500Hz** (polyphase resample) → R-peak 기준 `before=200ms / after=400ms` (=300 samples) → `beat_length=256` 으로 resample
-- **Normalize**: v1/v2는 **per-beat per-lead z-score**, v3는 **per-record (median, p75)·5 robust scaling** ([resampler.py:48-86](data/preprocessing/resampler.py#L48-L86))
+- **Normalize**: v4는 **record_mad** robust scaling을 사용하고, `record_mad_min_scale=0.05`, `record_mad_clip=8.0`으로 outlier amplification을 제한한다 ([resampler.py:48-86](data/preprocessing/resampler.py#L48-L86))
 - **Noise/flat 필터**: raw mV 단위로 `ptp<0.1` / `std<0.01` beat drop (정규화 *전*에 적용)
 
 ### File list 생성
 
 ```bash
-python scripts/build_full_heedb_filelist.py
+python scripts/build_full_heedb_filelist.py --heedb-root /path/to/heedb
 # → file_lists/train_files_full.txt (~11.23M)  +  val_files_full.txt (10K holdout)
 ```
 
 ---
 
-## 학습 실행 — v3 권장 흐름
+## 학습 실행 — v4 권장 흐름
 
-모든 launcher는 `GPUS=0,1,2,3,4` env로 GPU를 지정. 모든 train 루프는 `ckpt_dir/last.pt` 가 있으면 **자동 resume**.
+모든 launcher는 `GPUS=0,1,2,3` 같은 env로 GPU를 지정할 수 있다. 모든 train 루프는 `ckpt_dir/last.pt` 가 있으면 **자동 resume**.
 
-### ① Phase 1 — Tokenizer (4 codebook v3 ablation)
+### ① Phase 1 — Tokenizer (5 codebook v4 ablation)
 
 ```bash
-nohup ./scripts/run_tokenizer_ablation_v3.sh > tokenizer_v3.log 2>&1 &
+nohup ./scripts/run_tokenizer_ablation_v4.sh > tokenizer_v4.log 2>&1 &
 
 # 단일 codebook만
-ONLY=cb1024 ./scripts/run_tokenizer_ablation_v3.sh
+ONLY=cb1024 ./scripts/run_tokenizer_ablation_v4.sh
 ```
 
-`checkpoints/tokenizer_heedb_full_cb{256,512,1024,2048}_v3/best.pt` 산출. 모니터링: `loss_rec`, `loss_vq`, `perplexity`, `loss_spec`.
+`checkpoints/tokenizer_heedb_full_cb{128,256,512,1024,2048}_v4/best.pt` 산출. 모니터링: `loss_rec`, `loss_vq`, `perplexity`, `loss_spec`, `usage_entropy`.
 
-> v1/v2 ckpt는 그대로 유지되니 benchmark에서 `MODELS_OVERRIDE=ecgfm_hb_cb1024` 같은 식으로 비교 가능.
-
-### ② Phase 3 — Pretrain (4 codebook v3)
+### ② Phase 3 — Pretrain (5 codebook v4)
 
 ```bash
-nohup ./scripts/run_pretrain_ablation_v3.sh > pretrain_v3.log 2>&1 &
+nohup ./scripts/run_pretrain_ablation_v4.sh > pretrain_v4.log 2>&1 &
 
 # cb1024 단독으로 빠른 검증
-ONLY=cb1024 ./scripts/run_pretrain_ablation_v3.sh
+ONLY=cb1024 ./scripts/run_pretrain_ablation_v4.sh
 ```
 
 학습 step:
@@ -202,18 +190,15 @@ ONLY=cb1024 ./scripts/run_pretrain_ablation_v3.sh
 5. **Contrastive loss**: `ProjMLP(cls_v1)`, `ProjMLP(cls_v2)` → DDP all_gather → NT-Xent
 6. `loss = w_mlm·L_mlm + w_rr·L_rr + w_fid·L_fid + w_ctr·L_ctr`
 
-### ③ Phase 4 — Finetune (benchmark/ repo)
+### ③ Phase 4 — Finetune
 
 ```bash
-cd /home/irteam/local-node-d/hbkimi/benchmark
-# v3 ckpt가 들어가도록 models.sh / scripts/run_task_4cb.sh의 CKPT 경로를 _v3로 가리키도록 조정
-SKIP_CACHE=1 bash scripts/run_task_4cb.sh ptbxl_super
-SKIP_CACHE=1 bash scripts/run_task_4cb.sh zzu_pecg
+python -m training.finetune.train --config configs/finetune/arrhythmia.yaml
 ```
 
-`ECGFMHBEncoder`는 ckpt의 `model_cfg["normalize"]`를 자동 감지해서 record_mad / zscore를 맞춰서 입력 전처리한다. v1/v2 ckpt는 model_cfg에 키가 없어 자동으로 zscore fallback.
+프로젝트 외부 benchmark repo를 쓰는 경우에는 v4 checkpoint 경로(`checkpoints/pretrain_heedb_cb*_v4/best.pt`)와 record_mad preprocessing을 맞춘다.
 
-> Cache 주의: `record_mad`로 학습된 v3 모델은 `record_mad` 캐시가 필요. 기존 (v2) `zscore` 캐시를 재사용하면 manifest 불일치로 cache builder가 에러를 띄움. 새 cache_dir 지정 또는 `--normalize record_mad`로 빌드.
+> Cache 주의: `record_mad`로 학습된 v4 모델은 `record_mad` 캐시가 필요. 기존 `zscore` 캐시를 재사용하면 manifest 불일치로 cache builder가 에러를 띄움. 새 cache_dir 지정 또는 `--normalize record_mad`로 빌드.
 
 ---
 
@@ -221,37 +206,37 @@ SKIP_CACHE=1 bash scripts/run_task_4cb.sh zzu_pecg
 
 | Stage | 파일 | 핵심 |
 |---|---|---|
-| Encoder (tokenizer) | [models/tokenizer/encoder.py](models/tokenizer/encoder.py) | shared 1D-CNN, channels [32,64,128,256], stride 2×4 → AdaptiveAvgPool → Linear(256). l2_normalize=true (v2+). |
+| Encoder (tokenizer) | [models/tokenizer/encoder.py](models/tokenizer/encoder.py) | shared 1D-CNN, channels [32,64,128,256], stride 2×4 → AdaptiveAvgPool → Linear(256). v4 uses l2-normalized latent vectors. |
 | Codebook | [models/tokenizer/codebook.py](models/tokenizer/codebook.py) | EMA, cosine VQ. `_ema_update`에서 `dist.all_reduce(SUM)`로 모든 rank 동기화. Dead-code restart. |
 | Decoder | [models/tokenizer/decoder.py](models/tokenizer/decoder.py) | Linear → reshape → ConvTranspose1d ×4 (encoder mirror). |
 | Tokenizer Loss | [training/tokenizer/losses.py](training/tokenizer/losses.py) | `L_rec + α·L_vq + β·L_fid(grad) + γ·L_spec(multi-scale STFT)`. |
 | Embeddings | [models/context/embeddings.py](models/context/embeddings.py) | MorphEmb(K+1, +1=MASK), LeadEmb(12), BeatPosEmb(30), RhythmMLP(3→256→d, z-score 내장), GlobalContextCNN. |
-| Transformer | [models/transformer/ecg_model.py](models/transformer/ecg_model.py) | Pre-LN `nn.TransformerEncoder`. v3: 12 layers, d=512, FFN=2048, max_seq_len=384. |
+| Transformer | [models/transformer/ecg_model.py](models/transformer/ecg_model.py) | Pre-LN `nn.TransformerEncoder`. v4: 12 layers, d=512, FFN=2048, max_seq_len=384. |
 | Masking | [training/pretrain/masking.py](training/pretrain/masking.py) | lead_dropout(prob, min_leads, schedule) → mask_beat_tokens_span(ratio, span) → mask_rhythm_features. cross_lead_aligned=True (lead redundancy 차단). |
 | Heads | [models/heads/mlm_head.py](models/heads/mlm_head.py) | MaskedBeatModelingHead(d→K) / RR(d→3) / Fiducial(d→2) / Classifier. |
 | ★ Contrastive | [models/heads/contrastive_head.py](models/heads/contrastive_head.py) | ProjectionHead(d→hidden→128) + L2-norm + nt_xent_loss(τ=0.1, DDP all_gather). 학습 후 discard. |
 
 ---
 
-## 주요 하이퍼파라미터 (v3 main)
+## 주요 하이퍼파라미터 (v4 main)
 
 | 항목 | 값 | 위치 |
 |---|---|---|
-| target_fs | 500 Hz | 모든 v3 config |
+| target_fs | 500 Hz | 모든 v4 config |
 | beat_length | 256 (300 raw → 256 resample) | |
 | before/after_ms | 200 / 400 | |
-| codebook K | {256, 512, 1024, 2048} ablation, **1024 메인** | |
+| codebook K | {128, 256, 512, 1024, 2048} ablation, **1024 메인 예시** | |
 | latent_dim | 256 | |
-| Tokenizer normalize | **record_mad** (median + p75·5) | resampler.py |
-| Tokenizer batch / lr / epochs | 512/GPU · 3e-4 · 100 | DDP 5-7 GPU |
-| Transformer d_model / heads / layers | 512 / 8 / **12** | (★ v3: 8 → 12) |
+| Tokenizer normalize | **record_mad** + min_scale 0.05 + clip 8.0 | resampler.py |
+| Tokenizer batch / lr / epochs | 1024/GPU · 3e-4 · 100 | |
+| Transformer d_model / heads / layers | 512 / 8 / **12** | |
 | max_beats_per_lead | 30 | seq_len 1+30·12=361 |
-| mask_strategy / span_length | span / **3** | (★ v3: 10 → 3) |
-| beat / rhythm mask_ratio (max) | **0.5 / 0.5** | (★ v3: 0.8 → 0.5) |
-| mask_warmup | 0.15 → 0.5, **50 epochs linear** | (★ v3 새 schedule) |
-| lead_dropout / min_leads | **0.15 / 10** | (★ v3: 0.4/6 → 0.15/10) |
-| Pretrain batch / lr / epochs | 32/GPU · 3e-4 · 200 | global batch 160 (5-GPU) |
-| early_stop_metric | **val_acc_nontop** | (★ v3 default) |
+| mask_strategy / span_length | span / **3** | |
+| beat / rhythm mask_ratio (max) | **0.5 / 0.5** | |
+| mask_warmup | 0.15 → 0.5, **50 epochs linear** | |
+| lead_dropout / min_leads | **0.15 / 10** | |
+| Pretrain batch / lr / epochs | 64/GPU · 3e-4 · 200 | default 4-GPU launcher |
+| early_stop_metric | **val_acc_nontop** | |
 | Contrastive weight / τ / warmup | **0.3 / 0.1 / 5 ep** | NT-Xent on cls pair |
 | Loss weights | morph=1.0, rhythm=1.0, fid=1.0, ctr=0.3 | class-balanced α=0.5 |
 
@@ -290,7 +275,7 @@ SKIP_CACHE=1 bash scripts/run_task_4cb.sh zzu_pecg
 - **OMP_NUM_THREADS**: BLAS oversubscribe 방지로 1~4 강제 (launcher가 export).
 - **PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True** — large batch fragmentation 완화.
 - **자동 resume**: `ckpt_dir/last.pt` 자동 로드 (epoch/optimizer/scheduler/global_step/best_metric/proj_head 모두 복원).
-- **Two-view memory**: v3 contrastive enabled 시 transformer activation 약 **2×**. d=512 12-layer + B=32은 80GB GPU 기준 여유 있음. OOM 시 batch 절반.
+- **Two-view memory**: v4 contrastive enabled 시 transformer activation 약 **2×**. d=512 12-layer + B=64 기준 OOM이 나면 batch를 절반으로 낮춘다.
 
 ---
 
@@ -303,13 +288,13 @@ import torch, numpy as np
 from models.tokenizer.vqvae import VQVAE
 from data.preprocessing.resampler import compute_record_norm_stats, apply_record_norm
 
-ck = torch.load("checkpoints/tokenizer_heedb_full_cb1024_v3/best.pt", map_location="cpu")
+ck = torch.load("checkpoints/tokenizer_heedb_full_cb1024_v4/best.pt", map_location="cpu")
 tok = VQVAE(ck["model_cfg"]); tok.load_state_dict(ck["model"]); tok.eval()
 
-# v3 record_mad: per-record stat 한 번 계산하고 모든 beat에 적용
+# v4 record_mad: per-record stat 한 번 계산하고 모든 beat에 적용
 sig = np.random.randn(12, 5000).astype(np.float32) * 0.05   # raw mV
-med, sc = compute_record_norm_stats(sig)
-sig_norm = apply_record_norm(sig, med, sc)
+med, sc = compute_record_norm_stats(sig, min_scale=0.05)
+sig_norm = apply_record_norm(sig, med, sc, clip=8.0)
 # (extract / resample beats from sig_norm) → beats (M, 1, 256)
 # z_q, indices = tok.encode(beats)
 ```
@@ -318,20 +303,20 @@ sig_norm = apply_record_norm(sig, med, sc)
 
 ```python
 from src.encoders.ecg_fm_hb import ECGFMHBEncoder
-enc = ECGFMHBEncoder(checkpoint="checkpoints/pretrain_heedb_cb1024_v3/best.pt")
+enc = ECGFMHBEncoder(checkpoint="checkpoints/pretrain_heedb_cb1024_v4/best.pt")
 # enc.normalize 자동 = "record_mad" (model_cfg에 저장됨)
 # enc(x) → (seq_feat, cls_pooled)
 ```
 
 ---
 
-## 학습 상태 (snapshot)
+## 제출용 체크리스트
 
-| 모델 | Config | 상태 |
-|---|---|---|
-| Tokenizer v2 (4 codebook, full HEEDB) | `vqvae_heedb_full_cb*_v2.yaml` | ✅ 완료 |
-| Pretrain v2 (4 codebook) | `masked_beat_heedb_cb*_v2.yaml` | ✅ 완료 (ep 20–25 best, dominant token shortcut 진단됨) |
-| Finetune v2 (ptbxl_super, zzu_pecg) | `benchmark/scripts/run_task_4cb.sh` | ✅ 완료 — `results/{ptbxl_super,zzu_pecg}_4cb_*` |
-| **Tokenizer v3** (4 codebook) | `vqvae_heedb_full_cb*_v3.yaml` | ⏳ 학습 대기 |
-| **Pretrain v3** (4 codebook) | `masked_beat_heedb_cb*_v3.yaml` | ⏳ tokenizer 후 |
-| **Finetune v3** | benchmark/ + v3 ckpt | ⏳ pretrain 후 |
+| 항목 | 기준 |
+|---|---|
+| Tokenizer configs | `configs/tokenizer/vqvae_heedb_full_cb*_v4.yaml` |
+| Pretrain configs | `configs/pretrain/masked_beat_heedb_cb*_v4.yaml` |
+| Tokenizer launcher | `scripts/run_tokenizer_ablation_v4.sh` |
+| Pretrain launcher | `scripts/run_pretrain_ablation_v4.sh` |
+| Single-run defaults | `run_tokenizer.sh`, `run_pretrain.sh` 모두 cb1024 v4 config |
+| Main model | `models/transformer/ecg_model.py` |

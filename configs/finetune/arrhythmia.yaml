@@ -1,5 +1,5 @@
 # ── Fine-tuning: Arrhythmia Classification ─────────────────────────────────
-base_pretrain_ckpt: checkpoints/pretrain/best.pt
+base_pretrain_ckpt: checkpoints/pretrain_heedb_cb1024_v4/best.pt
 
 data:
   data_dir: /path/to/arrhythmia_data

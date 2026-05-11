@@ -1,4 +1,4 @@
-name: hbkim
+name: ecg-fm
 channels:
   - pytorch
   - nvidia

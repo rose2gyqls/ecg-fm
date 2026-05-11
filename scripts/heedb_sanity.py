@@ -3,7 +3,7 @@ scripts/heedb_sanity.py
 
 HEEDB 전처리/비트추출 파이프라인이 정상 동작하는지 한두 파일로 확인.
 Usage:
-    python -m scripts.heedb_sanity --data_dir /home/irteam/ddn-opendata1/h5/heedb/v4.0 --n 3
+    python -m scripts.heedb_sanity --data_dir /path/to/heedb --n 3
 """
 from __future__ import annotations
 import argparse, glob, os, sys, random

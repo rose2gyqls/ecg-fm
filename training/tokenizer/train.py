@@ -2,7 +2,7 @@
 Phase 1: VQ-VAE beat tokenizer training (DDP-aware).
 
 Single GPU:
-    python -m training.tokenizer.train --config configs/tokenizer/vqvae_base.yaml
+    python -m training.tokenizer.train --config configs/tokenizer/vqvae_heedb_full_cb1024_v4.yaml
 
 Multi-GPU:
     CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 \
@@ -571,7 +571,7 @@ def train(cfg: dict, resume: str | None = None):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", default="configs/tokenizer/vqvae_base.yaml")
+    parser.add_argument("--config", default="configs/tokenizer/vqvae_heedb_full_cb1024_v4.yaml")
     parser.add_argument("--resume", default=None,
                         help="Checkpoint path to resume from. "
                              "If omitted, ckpt_dir/last.pt is auto-loaded if present.")
