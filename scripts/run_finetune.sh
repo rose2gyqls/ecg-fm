@@ -1,12 +1,4 @@
 #!/bin/bash
-# scripts/run_finetune.sh
-# Phase 4: Downstream Fine-tuning
-#
-# Usage:
-#   bash scripts/run_finetune.sh arrhythmia
-#   bash scripts/run_finetune.sh mi
-#   bash scripts/run_finetune.sh heart_failure
-#   bash scripts/run_finetune.sh configs/finetune/custom.yaml   (직접 경로 지정)
 
 set -e
 
@@ -22,8 +14,6 @@ else
 fi
 
 TASK=${1:-arrhythmia}
-
-# 태스크명이 yaml 경로가 아니면 자동으로 경로 구성
 if [[ "$TASK" == *.yaml ]]; then
   CONFIG="$TASK"
 else
@@ -36,8 +26,6 @@ echo "  Task   : $TASK"
 echo "  Config : $CONFIG"
 echo "  Time   : $(date)"
 echo "========================================"
-
-# pretrained checkpoint 확인
 PT_CKPT=$("$PY" -c "
 import yaml
 with open('$CONFIG') as f: cfg = yaml.safe_load(f)
@@ -48,6 +36,6 @@ if [ ! -f "$PT_CKPT" ]; then
   echo "        Run Phase 3 first:  bash scripts/run_pretrain.sh"
   exit 1
 fi
-echo "  Pretrain ckpt: $PT_CKPT  ✓"
+echo "  Pretrain ckpt: $PT_CKPT  ok"
 
 "$PY" -m training.finetune.train --config "$CONFIG"

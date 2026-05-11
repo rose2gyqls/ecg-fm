@@ -1,46 +1,3 @@
-# ── VQ-VAE Beat Tokenizer v4 — 전체 HEEDB + codebook=512 ────────────────────
-#
-# v4 변경사항 (vs v3):
-#   v3는 record_mad 정규화로 V1↔V6 amplitude를 보존하려 했지만, 두 가지가
-#   학습을 망가뜨렸다:
-#     (a) compute_record_norm_stats가 (12,T) 전체 p75 하나만 쓰는 데다
-#         min_scale=0.01 mV에 floor → 일부 lead가 isoelectric인 record는
-#         scale이 floor에 걸려 살아있는 lead의 QRS를 ~20× 증폭.
-#         결과적으로 batch loss가 7+까지 튀는 spike가 매 epoch 발생.
-#     (b) cosine VQ + EMA + 공격적 dead-code restart(every 500 steps,
-#         threshold=1.0)로 codebook이 ppl≈90/512에서 thrash.
-#
-#   v4 fixes:
-#     1) data.preprocessing.resampler.compute_record_norm_stats를
-#        per-lead p75 → median across leads로 교체 + min_scale 0.05 mV.
-#        한 lead가 floor에 걸려도 나머지가 scale을 잡아주므로 outlier
-#        amplification이 사라짐. (코드는 한 곳만 바꾸면 모든 v3 config
-#        에도 영향이 가지만, v4에서만 새 floor + clip을 명시한다.)
-#     2) data.record_mad_clip=8.0  — normalize 후 |x|를 hard cap. 잔여
-#        outlier가 batch에 섞여도 loss spike 차단.
-#     3) data.record_mad_min_scale=0.05  — floor를 5× 올려 noise floor를
-#        amplify하지 않도록.
-#     4) codebook usage entropy regularizer (loss.delta=0.05) 추가:
-#        soft assignment H(p)를 최대화 방향으로 push해 V1~V6가 한 코드로
-#        뭉치는 collapse를 깬다. (v3 cb128 진단: lead III/V1~V6/aVF/aVL 의
-#        top-1이 모두 code #117로 동일.)
-#     5) loss.gamma 0.3 → 0.15  — record_mad 환경에서 spec이 total의 ~50%를
-#        먹어 학습 신호의 주된 noise 원인이 됨. 비중을 절반으로.
-#     6) codebook ema_decay 0.99 → 0.97  — half-life 69 → 23 step. v3에서는
-#        encoder가 점진적으로 새 방향을 발굴하는 속도를 EMA가 못 따라잡아
-#        loss_vq가 우상향(1.2e-4 → 2.5e-4)했음. cosine 유사도 환산 0.85→0.68.
-#        EMA 반감기를 3× 줄여 codebook이 encoder drift를 한 epoch 안에 추격.
-#     7) commitment_cost 0.1 → 0.25  — encoder가 매칭 code에 더 강하게 묶이도록.
-#        v2에서 “EMA + cosine 환경에선 0.25가 과해서 L_vq 우상향이 악화”
-#        가설로 0.1까지 내렸지만, v3 결과(loss_vq 우상향 + rec 동반 상승)
-#        가 그 가설을 반증함 → 0.25로 복원.
-#     8) restart_dead_every 500 → 2000, threshold 1.0 → 0.1
-#        — restart shock 빈도 감소 + 죽은 코드 판정 임계 보수화.
-#     9) training.warmup_epochs가 v3까지는 사용되지 않던 dead field였음.
-#        v4에서 LinearLR(0.01→1.0) + CosineAnnealingLR을 SequentialLR로
-#        실제로 chain. ep1~ep5 동안 lr ramp up.
-#    10) training.best_window=5  — best.pt를 sliding-window val_loss로
-#        선택해 single-eval noise outlier가 best.pt를 잠그지 못하게.
 
 data:
   source: heedb
@@ -52,10 +9,10 @@ data:
   after_ms: 400
   normalize: record_mad
   record_mad_scale: 5.0
-  record_mad_min_scale: 0.05            # ★ v4: 0.01 → 0.05
-  record_mad_clip: 8.0                  # ★ v4: post-norm hard cap
+  record_mad_min_scale: 0.05
+  record_mad_clip: 8.0
   max_beats_per_record: 10
-  record_cache_size: 8000              # ★ v4: 2000 → 8000 — 2TB RAM 활용해 R-peak cache hit ↑
+  record_cache_size: 8000
   cache: false
   n_leads: 12
   seed: 42
@@ -89,8 +46,8 @@ model:
   codebook:
     num_embeddings: 512
     embedding_dim: 256
-    commitment_cost: 0.25                # ★ v4: 0.1 → 0.25 — encoder를 code쪽으로 더 강하게 commit (v3 desync 차단)
-    ema_decay: 0.97                      # ★ v4: 0.99 → 0.97 — codebook EMA half-life ~23 step, encoder drift 추격
+    commitment_cost: 0.25
+    ema_decay: 0.97
     ema_update: true
     cosine: true
   latent_dim: 256
@@ -100,7 +57,7 @@ training:
   lr: 3e-4
   weight_decay: 1e-4
   max_epochs: 100
-  warmup_epochs: 5                       # ★ v4: 실제 적용됨
+  warmup_epochs: 5
   grad_clip: 1.0
   num_workers: 18
   prefetch_factor: 8
@@ -111,19 +68,19 @@ training:
     n_iter: 10
 
   early_stop_patience: 20
-  best_window: 5                         # ★ v4: smoothed best.pt
+  best_window: 5
 
   loss:
     alpha: 1.0
     beta: 2.0
-    gamma: 0.15                          # ★ v4: 0.3 → 0.15
-    delta: 0.05                          # ★ v4: usage entropy regularizer
+    gamma: 0.15
+    delta: 0.05
     use_gradient_loss: true
     fiducial_weight_map: false
     spec_n_ffts: [32, 64, 128]
 
-    restart_dead_every: 2000             # ★ v4: 500 → 2000
-    restart_dead_threshold: 0.1          # ★ v4: 1.0 → 0.1
+    restart_dead_every: 2000
+    restart_dead_threshold: 0.1
 
   log_dir:  logs/tokenizer_heedb_full_cb512_v4
   tb_dir:   logs/tb/tokenizer/cb512_v4

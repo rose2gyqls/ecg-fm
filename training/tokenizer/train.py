@@ -1,19 +1,7 @@
-"""
-Phase 1: VQ-VAE beat tokenizer training (DDP-aware).
-
-Single GPU:
-    python -m training.tokenizer.train --config configs/tokenizer/vqvae_heedb_full_cb1024_v4.yaml
-
-Multi-GPU:
-    CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 \
-        -m training.tokenizer.train --config configs/tokenizer/vqvae_heedb.yaml
-"""
-
 import argparse
 import os
 import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
-
 import time
 import yaml
 import torch
@@ -25,17 +13,13 @@ from collections import deque
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from tqdm.auto import tqdm
-
 from torch.utils.tensorboard import SummaryWriter
-
 from models.tokenizer.vqvae import VQVAE
 from training.tokenizer.losses import total_vqvae_loss, make_qrs_weight_map
 from utils.checkpointing import save_checkpoint
 from utils.logging_utils import MetricLogger
 
-
 def setup_ddp():
-    """Initialize DDP from torchrun env. Returns (False, 0, 1, 0) if not launched via torchrun."""
     if "LOCAL_RANK" not in os.environ:
         return False, 0, 1, 0
     dist.init_process_group(backend="nccl")
@@ -45,11 +29,9 @@ def setup_ddp():
     torch.cuda.set_device(local_rank)
     return True, rank, world_size, local_rank
 
-
 def cleanup_ddp():
     if dist.is_available() and dist.is_initialized():
         dist.destroy_process_group()
-
 
 def _fmt_dur(sec: float) -> str:
     sec = int(sec)
@@ -59,10 +41,6 @@ def _fmt_dur(sec: float) -> str:
     if m: return f"{m}m{s:02d}s"
     return f"{s}s"
 
-
-# ---------------------------------------------------------------------
-# K-means warm-up: collect z_e via encoder forward, seed codebook via K-means.
-# ---------------------------------------------------------------------
 @torch.no_grad()
 def kmeans_warmup(
     raw_model: VQVAE,
@@ -75,20 +53,10 @@ def kmeans_warmup(
     n_iter: int = 10,
     is_main: bool = True,
 ):
-    """
-    Run encoder forward over a few batches to build a z_e pool, then call
-    codebook.kmeans_init on it.
-
-    DDP: each rank collects locally, sizes are equalized, all_gather builds
-    the shared pool, rank 0 runs K-means, and the resulting buffers are
-    broadcast back. After this returns, every rank holds the same codebook.
-    """
-    raw_model.eval()                       # eval BN -> z_e distribution stable
+    raw_model.eval()
     K = raw_model.codebook.K
     D = raw_model.codebook.D
-
     per_rank = max(n_samples // max(world_size, 1), K * 8)
-
     local_chunks = []
     collected = 0
     pbar = tqdm(
@@ -104,16 +72,12 @@ def kmeans_warmup(
         if collected >= per_rank:
             break
     pbar.close()
-
     if not local_chunks:
         if is_main:
             print("[kmeans_warmup] no samples collected; skipping.")
         return
-
     local_pool = torch.cat(local_chunks, dim=0)[:per_rank]
-
     if ddp:
-        # all_gather requires identical shapes -> trim to the smallest rank.
         sizes = [torch.tensor([0], device=device) for _ in range(world_size)]
         dist.all_gather(sizes, torch.tensor([local_pool.shape[0]], device=device))
         min_size = int(min(s.item() for s in sizes))
@@ -123,10 +87,8 @@ def kmeans_warmup(
         pool = torch.cat(gathered, dim=0)
     else:
         pool = local_pool
-
     if is_main:
         print(f"[kmeans_warmup] pool shape = {tuple(pool.shape)} (K={K}, D={D})")
-
     if (not ddp) or rank == 0:
         raw_model.codebook.kmeans_init(pool, n_iter=n_iter, verbose=is_main)
     if ddp:
@@ -135,20 +97,15 @@ def kmeans_warmup(
             dist.broadcast(raw_model.codebook.ema_w.data, src=0)
             dist.broadcast(raw_model.codebook.ema_cluster_size.data, src=0)
 
-
 def train(cfg: dict, resume: str | None = None):
     ddp, rank, world_size, local_rank = setup_ddp()
     is_main = (rank == 0)
-
     if torch.cuda.is_available():
         device = torch.device(f"cuda:{local_rank}")
     else:
         device = torch.device("cpu")
-
     if is_main:
         print(f"[Tokenizer] DDP={ddp}  world_size={world_size}  device={device}")
-
-    # ---------- Data ----------
     source = cfg["data"].get("source", "npy")
     if source == "heedb":
         from data.datasets.heedb_beat_dataset import HEEDBBeatDataset as _DS
@@ -156,7 +113,6 @@ def train(cfg: dict, resume: str | None = None):
         from data.datasets.beat_dataset import BeatDataset as _DS
     train_ds = _DS(cfg["data"], split="train")
     val_ds   = _DS(cfg["data"], split="val")
-
     if ddp:
         train_sampler = DistributedSampler(
             train_ds, num_replicas=world_size, rank=rank,
@@ -168,7 +124,6 @@ def train(cfg: dict, resume: str | None = None):
     else:
         train_sampler = None
         val_sampler   = None
-
     nw = int(cfg["training"]["num_workers"])
     pf = int(cfg["training"].get("prefetch_factor", 4))
     loader_kwargs = dict(
@@ -192,10 +147,6 @@ def train(cfg: dict, resume: str | None = None):
         sampler=val_sampler,
         **loader_kwargs,
     )
-
-    # ---------- Model ----------
-    # Persist data-pipeline contract on the checkpoint so downstream consumers
-    # can self-describe (which normalization the tokenizer was trained with).
     cfg["model"].setdefault(
         "normalize", cfg["data"].get("normalize", "record_mad")
     )
@@ -205,29 +156,17 @@ def train(cfg: dict, resume: str | None = None):
     model = VQVAE(cfg["model"]).to(device)
     if is_main:
         print(f"[Tokenizer] Parameters: {sum(p.numel() for p in model.parameters()):,}")
-
     if ddp:
-        # EMA buffers are already synchronized via all_reduce inside _ema_update,
-        # so broadcast_buffers can stay False. find_unused_parameters is required
-        # because embedding.weight gets EMA-updated outside the autograd graph.
         model = DDP(
             model, device_ids=[local_rank], output_device=local_rank,
             broadcast_buffers=False, find_unused_parameters=True,
         )
     raw_model = model.module if ddp else model
-
-    # ---------- Optimizer / Scheduler ----------
     opt = AdamW(
         model.parameters(),
         lr=float(cfg["training"]["lr"]),
         weight_decay=float(cfg["training"]["weight_decay"]),
     )
-    # Real LR warmup. Earlier versions exposed `warmup_epochs` in config but
-    # only constructed CosineAnnealingLR, so the field was a no-op. v4 wires
-    # it through as a linear ramp from 1% lr → 100% lr over `warmup_epochs`,
-    # then cosine-anneals over the remaining epochs. This eliminates the
-    # epoch-1/2 transient where lr=3e-4 hits a freshly k-means-initialized
-    # codebook and produces large early-step gradient noise.
     max_epochs    = cfg["training"]["max_epochs"]
     warmup_epochs = int(cfg["training"].get("warmup_epochs", 0) or 0)
     if warmup_epochs > 0 and warmup_epochs < max_epochs:
@@ -241,31 +180,22 @@ def train(cfg: dict, resume: str | None = None):
         )
     else:
         scheduler = CosineAnnealingLR(opt, T_max=max_epochs)
-
     loss_cfg = cfg["training"]["loss"]
     ckpt_dir = cfg["training"]["ckpt_dir"]
     log_dir  = cfg["training"]["log_dir"]
-    # TensorBoard dir: when set, multiple cb runs can share a parent directory
-    # (e.g. logs/tb/tokenizer/cb{256,512,1024,2048}_v2) so a single
-    # `tensorboard --logdir logs/tb/tokenizer` shows them all together.
-    # Falls back to log_dir/tb for backwards compatibility.
     tb_dir   = cfg["training"].get("tb_dir") or os.path.join(log_dir, "tb")
     logger   = MetricLogger(log_dir) if is_main else None
     tb       = SummaryWriter(log_dir=tb_dir) if is_main else None
     if is_main:
         os.makedirs(ckpt_dir, exist_ok=True)
         print(f"[Tokenizer] log_dir={log_dir}  tb_dir={tb_dir}")
-
-    # ---------- Loss configuration ----------
     use_grad_loss  = bool(loss_cfg.get("use_gradient_loss", True))
     use_fid_weight = bool(loss_cfg.get("fiducial_weight_map", False))
     alpha          = float(loss_cfg.get("alpha", 1.0))
     beta           = float(loss_cfg.get("beta", 0.5))
     gamma          = float(loss_cfg.get("gamma", 0.0))
-    delta          = float(loss_cfg.get("delta", 0.0))     # entropy bonus
+    delta          = float(loss_cfg.get("delta", 0.0))
     spec_n_ffts    = tuple(loss_cfg.get("spec_n_ffts", (32, 64, 128)))
-
-    # QRS weight map (only used when use_gradient_loss is False).
     fid_weights = None
     if (not use_grad_loss) and use_fid_weight:
         data_cfg = cfg.get("data", {})
@@ -285,29 +215,15 @@ def train(cfg: dict, resume: str | None = None):
             print(f"[Tokenizer] QRS weight map: r_pos={r_pos} "
                   f"sigma={loss_cfg.get('fid_sigma', 20.0)} "
                   f"peak={loss_cfg.get('fid_peak', 3.0)}")
-
-    # Dead-code restart (0 disables).
     restart_every  = int(loss_cfg.get("restart_dead_every", 0) or 0)
     restart_thresh = float(loss_cfg.get("restart_dead_threshold", 1.0))
-
-    # Early stopping (0 disables).
     es_patience = int(cfg["training"].get("early_stop_patience", 0) or 0)
     es_bad = 0
-
-    # Sliding-window best-checkpoint selection. With high val_loss noise
-    # (CV ~6% on this dataset) a single-eval `min` rewards lucky outliers
-    # rather than a converged plateau — that's why v3's best.pt locked into
-    # epoch 2/4 even though training kept improving the latent. Using the
-    # mean over the last `best_window` evals smooths out per-epoch noise.
-    # 1 disables (legacy behaviour: any single-eval improvement wins).
     best_window  = int(cfg["training"].get("best_window", 1) or 1)
     val_history: deque[float] = deque(maxlen=best_window)
-
     best_val_loss = float("inf")
     start_epoch   = 1
     global_step   = 0
-
-    # ---------- Resume ----------
     if resume is None:
         last_path = os.path.join(ckpt_dir, "last.pt")
         if os.path.exists(last_path):
@@ -325,10 +241,8 @@ def train(cfg: dict, resume: str | None = None):
         global_step   = int(ckpt.get("global_step", 0))
         resumed_from_ckpt = True
         if is_main:
-            print(f"[Resume] Loaded {resume}  → start_epoch={start_epoch}  "
+            print(f"[Resume] Loaded {resume}  -> start_epoch={start_epoch}  "
                   f"best_val_loss={best_val_loss:.4f}", flush=True)
-
-    # K-means warmup runs once before the first training step, only for fresh runs.
     kmeans_cfg = cfg["training"].get("kmeans_init", {}) or {}
     if (
         not resumed_from_ckpt
@@ -349,21 +263,16 @@ def train(cfg: dict, resume: str | None = None):
         )
         if ddp:
             dist.barrier()
-
     t_global = time.time()
-
     for epoch in range(start_epoch, max_epochs + 1):
         if ddp and train_sampler is not None:
             train_sampler.set_epoch(epoch)
-
-        # ---------- Train ----------
         model.train()
         t_epoch = time.time()
         running = {"loss": 0.0, "loss_rec": 0.0, "loss_vq": 0.0,
                    "loss_fid": 0.0, "loss_spec": 0.0, "loss_ent": 0.0,
                    "perplexity": 0.0, "n_dead_restarted": 0.0}
         n_steps = 0
-
         pbar = tqdm(
             train_loader,
             desc=f"ep{epoch:03d}/{max_epochs:03d}",
@@ -371,7 +280,7 @@ def train(cfg: dict, resume: str | None = None):
             dynamic_ncols=True, mininterval=1.0, leave=False,
         )
         for batch in pbar:
-            x = batch["beat"].to(device, non_blocking=True)       # (B, 1, W)
+            x = batch["beat"].to(device, non_blocking=True)
             x_hat, vq_dict = model(x)
             losses = total_vqvae_loss(
                 x, x_hat, vq_dict["loss_vq"],
@@ -387,9 +296,6 @@ def train(cfg: dict, resume: str | None = None):
                 model.parameters(), cfg["training"]["grad_clip"]
             )
             opt.step()
-
-            # Dead-code restart: re-encode the same batch (no extra DataLoader
-            # round-trip) and let the codebook swap dead entries.
             n_dead_restarted = 0
             if restart_every > 0 and (global_step + 1) % restart_every == 0:
                 with torch.no_grad():
@@ -397,7 +303,6 @@ def train(cfg: dict, resume: str | None = None):
                 n_dead_restarted = raw_model.codebook.restart_dead_codes(
                     z_e, threshold=restart_thresh,
                 )
-
             global_step += 1
             if is_main:
                 vals = {
@@ -425,8 +330,6 @@ def train(cfg: dict, resume: str | None = None):
                     })
         pbar.close()
         scheduler.step()
-
-        # ---------- Epoch summary (rank 0) ----------
         if is_main and n_steps > 0:
             avg = {k: v / n_steps for k, v in running.items()}
             for k, v in avg.items():
@@ -446,8 +349,6 @@ def train(cfg: dict, resume: str | None = None):
                 f"elapsed={_fmt_dur(total_elapsed)}  eta={_fmt_dur(eta)}",
                 flush=True,
             )
-
-        # ---------- Eval ----------
         do_eval = (epoch % cfg["training"]["eval_every"] == 0)
         val_loss_for_es = None
         if do_eval:
@@ -480,7 +381,6 @@ def train(cfg: dict, resume: str | None = None):
                     local_sums["loss_ent"]  += losses["loss_ent"].item() * bs
                     local_sums["perplexity"] += vq_dict["perplexity"].item() * bs
                     local_cnt += bs
-
             keys = ["loss", "loss_rec", "loss_vq", "loss_fid",
                     "loss_spec", "loss_ent", "perplexity"]
             stats = torch.tensor(
@@ -492,20 +392,16 @@ def train(cfg: dict, resume: str | None = None):
             cnt = stats[-1].clamp(min=1)
             val_metrics = {k: (stats[i] / cnt).item() for i, k in enumerate(keys)}
             val_loss = val_metrics["loss"]
-
-            # Smoothed val_loss for both best.pt selection and early stop.
-            # Falls back to raw val_loss if best_window <= 1.
             val_history.append(val_loss)
             val_loss_smoothed = sum(val_history) / len(val_history)
             val_loss_for_es = val_loss_smoothed
-
             if is_main:
                 logger.update(split="val", epoch=epoch, **val_metrics)
                 for k, v in val_metrics.items():
                     tb.add_scalar(f"val/{k}", v, epoch)
                 tb.add_scalar("val/loss_smoothed", val_loss_smoothed, epoch)
                 improved = val_loss_smoothed < best_val_loss
-                tag = " ★best" if improved else ""
+                tag = " *best" if improved else ""
                 print(
                     f"          val  loss={val_loss:.4f}  "
                     f"smooth={val_loss_smoothed:.4f}  "
@@ -517,7 +413,6 @@ def train(cfg: dict, resume: str | None = None):
                     f"ppl={val_metrics['perplexity']:.1f}{tag}",
                     flush=True,
                 )
-
                 if improved:
                     best_val_loss = val_loss_smoothed
                     es_bad = 0
@@ -526,13 +421,10 @@ def train(cfg: dict, resume: str | None = None):
                                     model_cfg=cfg["model"])
                 else:
                     es_bad += 1
-
-        # ---------- Periodic + last checkpoint ----------
         if epoch % cfg["training"]["save_every"] == 0 and is_main:
             save_checkpoint(raw_model, opt, epoch, None,
                             path=os.path.join(ckpt_dir, f"epoch_{epoch:03d}.pt"),
                             model_cfg=cfg["model"])
-
         if is_main:
             save_checkpoint(
                 raw_model, opt, epoch, best_val_loss,
@@ -544,11 +436,8 @@ def train(cfg: dict, resume: str | None = None):
                     "global_step":   global_step,
                 },
             )
-
         if ddp:
             dist.barrier()
-
-        # ---------- Early stopping (broadcast across ranks) ----------
         if es_patience > 0 and val_loss_for_es is not None:
             stop_flag = 0
             if is_main and es_bad >= es_patience:
@@ -561,13 +450,11 @@ def train(cfg: dict, resume: str | None = None):
                 stop_flag = int(t.item())
             if stop_flag:
                 break
-
     if is_main:
         print(f"[Tokenizer] Training complete. Best val_loss={best_val_loss:.4f}")
         if tb is not None:
             tb.close()
     cleanup_ddp()
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

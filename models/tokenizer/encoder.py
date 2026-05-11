@@ -1,28 +1,9 @@
-"""
-Shared 1D-CNN encoder: beat segment -> continuous latent vector z_e.
-
-The same encoder weights are applied to every lead.
-"""
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Sequence
 
-
 class BeatEncoder(nn.Module):
-    """
-    Input : (B, 1, W)   single-channel beat
-    Output: (B, latent_dim)
-
-    Args:
-        l2_normalize: if True, project z onto a sphere of radius `latent_scale`
-                      (a learnable scalar). Useful as a soft norm bound when
-                      pairing with a non-cosine codebook. With cosine VQ this
-                      flag is redundant (the codebook normalizes anyway), so
-                      leave it False to keep things minimal.
-    """
-
     def __init__(
         self,
         in_channels: int = 1,
@@ -35,10 +16,8 @@ class BeatEncoder(nn.Module):
     ):
         super().__init__()
         assert len(channels) == len(kernel_sizes) == len(strides)
-
         self.l2_normalize = l2_normalize
         self.latent_dim = latent_dim
-
         layers = []
         in_ch = in_channels
         for out_ch, k, s in zip(channels, kernel_sizes, strides):
@@ -50,14 +29,11 @@ class BeatEncoder(nn.Module):
                 nn.Dropout(dropout),
             ]
             in_ch = out_ch
-
         self.conv_stack = nn.Sequential(*layers)
         self.pool = nn.AdaptiveAvgPool1d(1)
         self.project = nn.Linear(in_ch, latent_dim)
-
         if l2_normalize:
             self.latent_scale = nn.Parameter(torch.tensor(latent_dim ** 0.5))
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         h = self.conv_stack(x)
         h = self.pool(h).squeeze(-1)

@@ -1,6 +1,3 @@
-# ── Pre-training v4 (Masked Beat Modeling, HEEDB) — codebook=128 ────────────
-# v4 변경사항은 masked_beat_heedb_cb512_v4.yaml 헤더 참조.
-# (v3 pretrain에는 cb128이 없었으므로 v4에서 처음 추가 — 비교 baseline 용도.)
 data:
   source: heedb
   train_list: file_lists/train_files.txt
@@ -60,13 +57,13 @@ masking:
   lead_dropout_min_leads: 10
 
 training:
-  batch_size: 64                       # ★ v4: 32 → 64 (4-GPU effective 256)
+  batch_size: 64
   lr: 3e-4
   weight_decay: 1e-4
   max_epochs: 200
   warmup_epochs: 20
   grad_clip: 1.0
-  num_workers: 18                      # ★ v4: 12 → 18 (4 GPU × 18 = 72 workers)
+  num_workers: 18
   prefetch_factor: 8
 
   early_stop_metric: val_acc_nontop

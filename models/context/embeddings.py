@@ -1,40 +1,15 @@
-"""
-Token-level embedding modules used by ECGFoundationModel.
-
-Each component projects to d_model so that the per-(beat, lead) token can be
-formed by element-wise addition:
-    T_{i,j} = MorphologyEmbedding(z) + RhythmMLP(rr) + LeadEmb(j) + BeatPos(i)
-"""
-
 import torch
 import torch.nn as nn
 
-
 class LeadEmbedding(nn.Embedding):
-    """Lead index (0..n_leads-1) -> (d_model,)."""
-
     def __init__(self, n_leads: int = 12, d_model: int = 256):
         super().__init__(n_leads, d_model)
 
-
 class BeatPositionEmbedding(nn.Embedding):
-    """Beat-position index within a record (0..max_beats-1) -> (d_model,)."""
-
     def __init__(self, max_beats: int = 20, d_model: int = 256):
         super().__init__(max_beats, d_model)
 
-
 class RhythmMLP(nn.Module):
-    """
-    Map [prev_rr, next_rr, median_rr] (seconds) to a d_model vector.
-
-    Optional input normalization: pass `norm_mean` and `norm_std` to make
-    forward apply z-score before the MLP. Raw RR values vary on a tight
-    range (0.5-1.2s) so unnormalized inputs look near-constant to the MLP.
-    The stats are registered as buffers, so they ride in state_dict and
-    transfer automatically to any downstream encoder that loads the ckpt.
-    """
-
     def __init__(
         self,
         input_dim: int = 3,
@@ -51,7 +26,6 @@ class RhythmMLP(nn.Module):
             nn.GELU(),
             nn.Linear(hidden, d_model),
         )
-
         if norm_mean is not None and norm_std is not None:
             mean_t = torch.tensor(norm_mean, dtype=torch.float32)
             std_t = torch.tensor(norm_std, dtype=torch.float32)
@@ -64,21 +38,12 @@ class RhythmMLP(nn.Module):
             self._normalize = True
         else:
             self._normalize = False
-
     def forward(self, rr: torch.Tensor) -> torch.Tensor:
         if self._normalize:
             rr = (rr - self.norm_mean) / (self.norm_std + 1e-8)
         return self.net(rr)
 
-
 class GlobalContextCNN(nn.Module):
-    """
-    2D-CNN on the multi-lead log-magnitude STFT map.
-
-    Input : (B, n_leads, F, T')
-    Output: (B, d_model)  -- global summary vector g.
-    """
-
     def __init__(
         self,
         in_channels: int = 12,
@@ -98,21 +63,14 @@ class GlobalContextCNN(nn.Module):
         self.cnn = nn.Sequential(*layers)
         self.pool = nn.AdaptiveAvgPool2d(1)
         self.project = nn.Linear(in_ch, d_model)
-
     def forward(self, stft: torch.Tensor) -> torch.Tensor:
         h = self.cnn(stft)
         h = self.pool(h).flatten(1)
         return self.project(h)
 
-
 class MorphologyEmbedding(nn.Embedding):
-    """
-    Codebook index -> (d_model,). Includes one extra row for the [MASK] token.
-    """
-
     def __init__(self, codebook_size: int = 512, d_model: int = 256):
         super().__init__(codebook_size + 1, d_model)
         self.mask_token_id = codebook_size
-
     def get_mask_token(self, shape, device):
         return torch.full(shape, self.mask_token_id, dtype=torch.long, device=device)

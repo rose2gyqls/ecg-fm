@@ -1,10 +1,9 @@
-# ── Fine-tuning: Arrhythmia Classification ─────────────────────────────────
 base_pretrain_ckpt: checkpoints/pretrain_heedb_cb1024_v4/best.pt
 
 data:
   data_dir: /path/to/arrhythmia_data
   label_col: rhythm_label
-  n_classes: 5                          # e.g. NSR, AF, VT, SVT, other
+  n_classes: 5
   fs: 500
   beat_length: 256
   n_leads: 12
@@ -12,12 +11,12 @@ data:
   val_ratio: 0.1
 
 model:
-  freeze_transformer: false             # true: head only, false: full fine-tune
-  freeze_layers: 0                      # 앞에서 N layers freeze (0=no freeze)
+  freeze_transformer: false
+  freeze_layers: 0
   classifier:
     hidden_dim: 256
     dropout: 0.3
-    pooling: cls                        # "cls" | "mean"
+    pooling: cls
 
 training:
   batch_size: 64

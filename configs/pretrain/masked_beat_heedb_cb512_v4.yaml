@@ -1,18 +1,3 @@
-# ── Pre-training v4 (Masked Beat Modeling, HEEDB) — codebook=512 ────────────
-#
-# v4 변경사항 (vs v3): tokenizer dependency만 v3 → v4로 교체.
-#   - tokenizer.ckpt: cb512_v3/best.pt → cb512_v4/best.pt
-#     (v4 토크나이저는 v3 대비 val_rec 27.2% 개선,
-#      record_mad outlier amplification 차단 + cosine VQ EMA tracking 강화 +
-#      entropy bonus로 codebook 활용도 33% → 93% 도약.)
-#   - log/ckpt 디렉토리만 _v3 → _v4 접미어로 격리.
-#   - pretrain side 하이퍼파라미터(MLM + RR + fiducial + SimCLR contrastive)는
-#     v3 그대로. masking curriculum, lead_dropout, val_acc_nontop 기준 등
-#     v3 설계 결정이 검증되지 않았기 때문에 우선 v4 토크나이저의 효과만
-#     단독 측정.
-#
-# 호환성: 새 ckpt는 model_cfg에 normalize/contrastive 메타가 들어가서
-# benchmark/src/encoders/ecg_fm_hb.py 가 자동 감지함.
 data:
   source: heedb
   train_list: file_lists/train_files.txt
@@ -31,8 +16,6 @@ data:
   fiducial:
     q_window_ms: 50
     s_window_ms: 80
-
-  # RR / fiducial target z-score statistics (clinical priors).
   normalization:
     rr_mean:  [0.85, 0.85, 0.85]
     rr_std:   [0.20, 0.20, 0.15]
@@ -40,7 +23,7 @@ data:
     fid_std:  [0.015, 0.020]
 
 tokenizer:
-  ckpt: checkpoints/tokenizer_heedb_full_cb512_v4/best.pt   # ★ v4: cb512_v3 → cb512_v4
+  ckpt: checkpoints/tokenizer_heedb_full_cb512_v4/best.pt
   codebook_size: 512
   latent_dim: 256
 
@@ -73,13 +56,13 @@ masking:
   lead_dropout_min_leads: 10
 
 training:
-  batch_size: 64                       # ★ v4: 32 → 64 (4-GPU effective 256)
+  batch_size: 64
   lr: 3e-4
   weight_decay: 1e-4
   max_epochs: 200
   warmup_epochs: 20
   grad_clip: 1.0
-  num_workers: 18                      # ★ v4: 12 → 18 (4 GPU × 18 = 72 workers)
+  num_workers: 18
   prefetch_factor: 8
 
   early_stop_metric: val_acc_nontop
@@ -98,8 +81,8 @@ training:
     proj_out: 128
     warmup_epochs: 5
 
-  log_dir:  logs/pretrain_heedb_cb512_v4                    # ★ v4
-  tb_dir:   logs/tb/pretrain/cb512_v4                       # ★ v4
-  ckpt_dir: checkpoints/pretrain_heedb_cb512_v4             # ★ v4
+  log_dir:  logs/pretrain_heedb_cb512_v4
+  tb_dir:   logs/tb/pretrain/cb512_v4
+  ckpt_dir: checkpoints/pretrain_heedb_cb512_v4
   save_every: 10
   eval_every: 5
